@@ -14,7 +14,6 @@
 #define NOMINMAX
 #include <windows.h>
 #include "vulkan/vulkan.hpp"
-#include "VulkanSDKCompat.h"
 
 #include "Camera.h"
 #include "GameTimer.h"

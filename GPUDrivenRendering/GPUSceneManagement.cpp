@@ -75,7 +75,9 @@ void GPUSceneManagement::Initialise() {
 	vk::PhysicalDeviceProperties props = m_renderer->GetPhysicalDevice().getProperties();
 	m_gpuTimestampPeriod = props.limits.timestampPeriod;
 
-	vk::QueryPoolCreateInfo qpCreate(vk::QueryType::eTimestamp, 4);
+	vk::QueryPoolCreateInfo qpCreate{};
+	qpCreate.queryType  = vk::QueryType::eTimestamp;
+	qpCreate.queryCount = 4;
 	m_queryPool = ctx.device.createQueryPoolUnique(qpCreate);
 
 	m_camera.SetFieldOfVision(45.0f).SetNearPlane(0.1f).SetFarPlane(2000.0f);

@@ -239,21 +239,21 @@ void GPUSceneManagement::CreateBuffers() {
 	FrameContext const& ctx = m_renderer->GetFrameContext();
 
 	m_cullingBuffer = m_memoryManager->CreateBuffer(
-		{ sizeof(CullingDatum) * m_totalInstances, vk::BufferUsageFlagBits::eStorageBuffer },
+		{ .size = sizeof(CullingDatum) * m_totalInstances, .usage = vk::BufferUsageFlagBits::eStorageBuffer },
 		vk::MemoryPropertyFlagBits::eDeviceLocal, "CullingData");
 
 	m_renderBuffer = m_memoryManager->CreateBuffer(
-		{ sizeof(RenderDatum) * m_totalInstances, vk::BufferUsageFlagBits::eStorageBuffer },
+		{ .size = sizeof(RenderDatum) * m_totalInstances, .usage = vk::BufferUsageFlagBits::eStorageBuffer },
 		vk::MemoryPropertyFlagBits::eDeviceLocal, "RenderData");
 
 	uint32_t indirectSize = m_gridChunks * m_gridChunks * 2 * 5 * sizeof(uint32_t);
 	m_indirectBuffer = m_memoryManager->CreateBuffer(
-		{ indirectSize, vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eIndirectBuffer },
+		{ .size = indirectSize, .usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eIndirectBuffer },
 		vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
 		"IndirectBuffer");
 
 	m_chunkBuffer = m_memoryManager->CreateBuffer(
-		{ sizeof(ChunkInfo) * m_chunks.size(), vk::BufferUsageFlagBits::eStorageBuffer },
+		{ .size = sizeof(ChunkInfo) * m_chunks.size(), .usage = vk::BufferUsageFlagBits::eStorageBuffer },
 		vk::MemoryPropertyFlagBits::eDeviceLocal, "ChunkBuffer");
 
 	WriteInstanceData();
@@ -263,19 +263,19 @@ void GPUSceneManagement::WriteInstanceData() {
 	FrameContext const& ctx = m_renderer->GetFrameContext();
 
 	auto stagingCull = m_memoryManager->CreateBuffer(
-		{ sizeof(CullingDatum) * m_totalInstances, vk::BufferUsageFlagBits::eTransferSrc },
+		{ .size = sizeof(CullingDatum) * m_totalInstances, .usage = vk::BufferUsageFlagBits::eTransferSrc },
 		vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent, "StgCull");
 	memcpy(stagingCull.Map<CullingDatum>(), m_cullingData.data(), sizeof(CullingDatum) * m_totalInstances);
 	stagingCull.Unmap();
 
 	auto stagingRender = m_memoryManager->CreateBuffer(
-		{ sizeof(RenderDatum) * m_totalInstances, vk::BufferUsageFlagBits::eTransferSrc },
+		{ .size = sizeof(RenderDatum) * m_totalInstances, .usage = vk::BufferUsageFlagBits::eTransferSrc },
 		vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent, "StgRender");
 	memcpy(stagingRender.Map<RenderDatum>(), m_renderData.data(), sizeof(RenderDatum) * m_totalInstances);
 	stagingRender.Unmap();
 
 	auto stagingChunk = m_memoryManager->CreateBuffer(
-		{ sizeof(ChunkInfo) * m_chunks.size(), vk::BufferUsageFlagBits::eTransferSrc },
+		{ .size = sizeof(ChunkInfo) * m_chunks.size(), .usage = vk::BufferUsageFlagBits::eTransferSrc },
 		vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent, "StgChunk");
 	memcpy(stagingChunk.Map<ChunkInfo>(), m_chunks.data(), sizeof(ChunkInfo) * m_chunks.size());
 	stagingChunk.Unmap();
@@ -364,7 +364,7 @@ static bool AABBInFrustum(const Vector4 planes[6], float minX, float minY, float
 		Vector3 p(planes[i].x > 0 ? maxX : minX,
 		          planes[i].y > 0 ? maxY : minY,
 		          planes[i].z > 0 ? maxZ : minZ);
-		if (Vector3::Dot(Vector3(planes[i].x, planes[i].y, planes[i].z), p) + planes[i].w < 0)
+		if (Vector::Dot(Vector3(planes[i].x, planes[i].y, planes[i].z), p) + planes[i].w < 0)
 			return false;
 	}
 	return true;

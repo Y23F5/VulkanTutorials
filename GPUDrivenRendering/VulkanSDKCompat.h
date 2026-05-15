@@ -8,4 +8,9 @@
 
 namespace vk {
 	struct ShaderDescriptorSetAndBindingMappingInfoEXT {};
+
+	using PipelineCreateFlags2 = uint64_t;
+	namespace PipelineCreateFlagBits2 {
+		constexpr uint64_t eDescriptorHeapEXT = 0;
+	}
 }

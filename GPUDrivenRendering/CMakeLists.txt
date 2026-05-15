@@ -42,7 +42,7 @@ file(GLOB SHADER_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/Shaders/*.vert
 set(SHADER_OUTPUTS "")
 foreach(SHADER ${SHADER_SOURCES})
     get_filename_component(SHADER_NAME ${SHADER} NAME)
-    set(SPV_OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/Shaders/${SHADER_NAME}.spv)
+    set(SPV_OUTPUT ${CMAKE_SOURCE_DIR}/Assets/Shaders/VK/${SHADER_NAME}.spv)
     add_custom_command(
         OUTPUT ${SPV_OUTPUT}
         COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 ${SHADER} -o ${SPV_OUTPUT}

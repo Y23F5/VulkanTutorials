@@ -1,0 +1,59 @@
+#version 460
+#extension GL_EXT_scalar_block_layout : enable
+
+layout(local_size_x = 64) in;
+
+struct ChunkInfo {
+    uvec2 gridPos;
+    uint  instanceOffset;
+    uint  instanceCount;
+    uint  cubeCount;
+    uint  sphereCount;
+    vec3  aabbMin;
+    vec3  aabbMax;
+};
+
+layout(set = 0, binding = 0, scalar) readonly buffer ChunkBuffer { ChunkInfo chunks[]; } chunkData;
+layout(set = 0, binding = 1) buffer IndirectBuffer { uint commands[]; } indirect;
+
+layout(push_constant) uniform FrustumData {
+    vec4 planes[6];
+    uint numChunks;
+    uint cubeIndexCount;
+    uint sphereIndexCount;
+} frustum;
+
+bool isAABBVisible(vec3 aabbMin, vec3 aabbMax) {
+    for (int i = 0; i < 6; i++) {
+        vec3 p = vec3(
+            frustum.planes[i].x > 0.0 ? aabbMax.x : aabbMin.x,
+            frustum.planes[i].y > 0.0 ? aabbMax.y : aabbMin.y,
+            frustum.planes[i].z > 0.0 ? aabbMax.z : aabbMin.z
+        );
+        if (dot(frustum.planes[i].xyz, p) + frustum.planes[i].w < 0.0) return false;
+    }
+    return true;
+}
+
+void main() {
+    uint chunkIdx = gl_GlobalInvocationID.x;
+    if (chunkIdx >= frustum.numChunks) return;
+
+    ChunkInfo chunk = chunkData.chunks[chunkIdx];
+    bool visible = isAABBVisible(chunk.aabbMin, chunk.aabbMax);
+
+    uint base = chunkIdx * 2 * 5;
+
+    indirect.commands[base + 0] = frustum.cubeIndexCount;
+    indirect.commands[base + 1] = visible ? chunk.cubeCount : 0;
+    indirect.commands[base + 2] = 0;
+    indirect.commands[base + 3] = 0;
+    indirect.commands[base + 4] = chunk.instanceOffset;
+
+    base += 5;
+    indirect.commands[base + 0] = frustum.sphereIndexCount;
+    indirect.commands[base + 1] = visible ? chunk.sphereCount : 0;
+    indirect.commands[base + 2] = 0;
+    indirect.commands[base + 3] = 0;
+    indirect.commands[base + 4] = chunk.instanceOffset + chunk.cubeCount;
+}

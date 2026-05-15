@@ -125,6 +125,9 @@ void GPUSceneManagement::UploadCameraUniform() {
 
 void GPUSceneManagement::SetBenchmarkConfig(const BenchmarkConfig& config) {
 	m_benchConfig = config;
+	std::cout << "[GPUDriven] SetBenchmarkConfig: grid=" << config.gridSize
+	          << " chunk=" << config.chunkSize << " density=" << config.density
+	          << " scheme=" << (int)config.scheme << " seed=" << config.seed << "\n";
 
 	GenerateScene();
 	CreateBuffers();
@@ -159,6 +162,8 @@ void GPUSceneManagement::RunFrame(float dt) {
 }
 
 void GPUSceneManagement::GenerateScene() {
+	std::cout << "[GPUDriven] Generating scene...\n";
+
 	WFCGenerator gen;
 	WFCConfig wfcCfg;
 	wfcCfg.gridSize = m_benchConfig.gridSize;

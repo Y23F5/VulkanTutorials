@@ -14,6 +14,7 @@
 #include <chrono>
 #include <functional>
 #include <string>
+#include <iostream>
 
 #ifndef NOMINMAX
 #define NOMINMAX

@@ -152,6 +152,9 @@ void GPUSceneManagement::RunFrame(float dt) {
 
 	m_renderer->EndFrame();
 	m_renderer->SwapBuffers();
+
+	if (m_currentFrame == 0)
+		std::cout << "[GPUDriven] First frame rendered\n";
 	m_currentFrame++;
 }
 
@@ -217,6 +220,11 @@ void GPUSceneManagement::GenerateScene() {
 	}
 
 	ComputeChunkAABBs();
+
+	std::cout << "[GPUDriven] " << m_totalInstances << " instances in "
+	          << m_chunks.size() << " chunks (grid " << m_benchConfig.gridSize
+	          << ", chunk " << m_benchConfig.chunkSize
+	          << "), scheme=" << (int)m_benchConfig.scheme << "\n";
 }
 
 void GPUSceneManagement::ComputeChunkAABBs() {

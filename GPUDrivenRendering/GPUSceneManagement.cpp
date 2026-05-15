@@ -82,7 +82,7 @@ void GPUSceneManagement::Initialise() {
 	m_queryPool = ctx.device.createQueryPoolUnique(qpCreate);
 
 	m_camera.SetFieldOfVision(45.0f).SetNearPlane(0.1f).SetFarPlane(2000.0f);
-	m_camera.SetPosition(Vector3(128, 160, 320));
+	m_camera.SetPosition(Vector3(128, 64, -128));
 	m_camera.SetPitch(-55.0f).SetYaw(180.0f);
 	m_camera.SetController(m_controller);
 
@@ -131,7 +131,7 @@ void GPUSceneManagement::SetBenchmarkConfig(const BenchmarkConfig& config) {
 	CreateDescriptorSets();
 
 	float sceneSize = m_benchConfig.gridSize * 2.0f;
-	m_camera.SetPosition(Vector3(sceneSize * 0.5f, sceneSize * 0.6f, sceneSize * 1.2f));
+	m_camera.SetPosition(Vector3(sceneSize * 0.5f, sceneSize * 0.25f, -sceneSize * 0.5f));
 	m_camera.SetPitch(-55.0f).SetYaw(180.0f);
 }
 
@@ -257,7 +257,7 @@ void GPUSceneManagement::CreateBuffers() {
 
 	uint32_t indirectSize = m_gridChunks * m_gridChunks * 2 * 5 * sizeof(uint32_t);
 	m_indirectBuffer = m_memoryManager->CreateBuffer(
-		{ .size = indirectSize, .usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eIndirectBuffer },
+		{ .size = indirectSize, .usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eIndirectBuffer | vk::BufferUsageFlagBits::eTransferDst },
 		vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
 		"IndirectBuffer");
 

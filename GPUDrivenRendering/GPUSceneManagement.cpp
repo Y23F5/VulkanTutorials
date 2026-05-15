@@ -498,15 +498,93 @@ void GPUSceneManagement::RenderScheme3(float dt) {
 	ctx.cmdBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *m_graphicsPipeline.layout,
 		0, 1, &*m_sceneDescriptor, 0, nullptr);
 
-	uint32_t stride    = 2 * 5 * sizeof(uint32_t);
-	uint32_t drawCount = (uint32_t)m_chunks.size();
+	uint32_t stride3    = 2 * 5 * sizeof(uint32_t);
+	uint32_t drawCount3 = (uint32_t)m_chunks.size();
 
 	m_cubeMesh->BindToCommandBuffer(ctx.cmdBuffer);
-	ctx.cmdBuffer.drawIndexedIndirect(m_indirectBuffer.buffer, 0, drawCount, stride);
+	ctx.cmdBuffer.drawIndexedIndirect(m_indirectBuffer.buffer, 0, drawCount3, stride3);
 
 	m_sphereMesh->BindToCommandBuffer(ctx.cmdBuffer);
-	ctx.cmdBuffer.drawIndexedIndirect(m_indirectBuffer.buffer, 5 * sizeof(uint32_t), drawCount, stride);
+	ctx.cmdBuffer.drawIndexedIndirect(m_indirectBuffer.buffer, 5 * sizeof(uint32_t), drawCount3, stride3);
 
 	ctx.cmdBuffer.endRendering();
 	EndMeasurement();
 }
+
+void GPUSceneManagement::BeginMeasurement() {
+	if (!m_isRecording && m_currentFrame >= m_benchConfig.warmupFrames) {
+		m_isRecording = true;
+	}
+	if (!m_isRecording) return;
+
+	QueryPerformanceCounter(&m_frameStartQpc);
+
+	FrameContext const& ctx = m_renderer->GetFrameContext();
+	ctx.cmdBuffer.resetQueryPool(*m_queryPool, 0, 2);
+	ctx.cmdBuffer.writeTimestamp2(vk::PipelineStageFlagBits2::eTopOfPipe, *m_queryPool, 0);
+}
+
+void GPUSceneManagement::EndMeasurement() {
+	if (!m_isRecording) return;
+
+	LARGE_INTEGER endQpc;
+	QueryPerformanceCounter(&endQpc);
+
+	FrameContext const& ctx = m_renderer->GetFrameContext();
+	ctx.cmdBuffer.writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe, *m_queryPool, 1);
+
+	FrameStats stats = {};
+	stats.totalTimeUs = (double)(endQpc.QuadPart - m_frameStartQpc.QuadPart)
+	                   * m_cpuTimestampPeriod / 1000.0;
+	stats.drawCalls   = 2;
+
+	uint32_t visCount = 0;
+	for (bool v : m_chunkVisible) if (v) visCount++;
+	stats.visibleInstances = visCount;
+
+	m_frameStats.push_back(stats);
+
+	if (m_frameStats.size() >= m_benchConfig.recordFrames) {
+		Finish();
+		auto result = ctx.device.getQueryPoolResults<uint64_t>(*m_queryPool, 0, 2,
+			2 * sizeof(uint64_t), sizeof(uint64_t),
+			vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
+		uint64_t gpuNs = (result[1] - result[0]) * m_gpuTimestampPeriod;
+		m_frameStats.back().gpuTimeUs = gpuNs / 1000.0;
+
+		WriteCSVSummary();
+		m_isRecording = false;
+		m_benchmarkComplete = true;
+	}
+}
+
+void GPUSceneManagement::WriteCSVSummary() {
+	if (m_benchConfig.outputPath.empty()) return;
+
+	std::ofstream file(m_benchConfig.outputPath);
+	file << "frame,cpu_us,gpu_us,total_us,draw_calls,visible_instances\n";
+
+	std::vector<double> totalTimes;
+	for (uint32_t i = 0; i < m_frameStats.size(); ++i) {
+		const auto& s = m_frameStats[i];
+		file << i << "," << s.cpuTimeUs << "," << s.gpuTimeUs << ","
+		     << s.totalTimeUs << "," << s.drawCalls << "," << s.visibleInstances << "\n";
+		totalTimes.push_back(s.totalTimeUs);
+	}
+
+	std::sort(totalTimes.begin(), totalTimes.end());
+	double avg = std::accumulate(totalTimes.begin(), totalTimes.end(), 0.0) / totalTimes.size();
+	double min = totalTimes.front(), max = totalTimes.back();
+	double p1  = totalTimes[totalTimes.size() / 100];
+	double p99 = totalTimes[totalTimes.size() * 99 / 100];
+	double stddev = 0.0;
+	for (double t : totalTimes) stddev += (t - avg) * (t - avg);
+	stddev = sqrt(stddev / totalTimes.size());
+
+	file << "AVG," << avg << "\nMIN," << min << "\nMAX," << max
+	     << "\nP1," << p1 << "\nP99," << p99 << "\nSTDDEV," << stddev << "\n";
+}
+
+void GPUSceneManagement::CreateOffscreenResources() {}
+void GPUSceneManagement::BeginOffscreenRender(vk::CommandBuffer) {}
+

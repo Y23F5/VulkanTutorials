@@ -14,6 +14,10 @@
 #include "VulkanVMAMemoryManager.h"
 #include "MshLoader.h"
 
+#ifdef USE_IMGUI
+#include "ChunkMonitor.h"
+#endif
+
 using namespace NCL;
 using namespace Rendering;
 using namespace Vulkan;

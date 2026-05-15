@@ -79,11 +79,6 @@ std::vector<uint32_t> WFCGenerator::Generate(const WFCConfig& config) {
 	return grid;
 }
 
-bool WFCGenerator::Collapse(std::vector<uint32_t>& grid,
-	std::vector<std::vector<uint32_t>>& possibilities, uint32_t gridSize) {
-	return false;
-}
-
 void WFCGenerator::Propagate(std::vector<std::vector<uint32_t>>& possibilities,
 	uint32_t gridSize, uint32_t startX, uint32_t startY) {
 

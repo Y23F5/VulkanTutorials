@@ -49,9 +49,6 @@ public:
 	static constexpr uint32_t kEmptyTile = 0;
 
 private:
-	bool Collapse(std::vector<uint32_t>& grid,
-		std::vector<std::vector<uint32_t>>& possibilities,
-		uint32_t gridSize);
 	void Propagate(std::vector<std::vector<uint32_t>>& possibilities,
 		uint32_t gridSize, uint32_t changedX, uint32_t changedY);
 	bool IsValidAdjacency(uint32_t tileA, uint32_t tileB) const;

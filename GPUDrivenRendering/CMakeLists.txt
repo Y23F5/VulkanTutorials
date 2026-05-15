@@ -12,6 +12,7 @@ target_include_directories(${TARGET_NAME} PRIVATE
     ${CMAKE_SOURCE_DIR}/NCLCoreClasses
     ${CMAKE_SOURCE_DIR}/VulkanRendering
     ${CMAKE_SOURCE_DIR}/GLTFLoader
+    ${CMAKE_SOURCE_DIR}/VulkanTutorials
 )
 
 target_compile_features(${TARGET_NAME} PRIVATE cxx_std_20)

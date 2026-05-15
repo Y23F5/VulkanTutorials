@@ -14,14 +14,16 @@
 #define NOMINMAX
 #include <windows.h>
 #include "vulkan/vulkan.hpp"
+#include "VulkanSDKCompat.h"
 
-#include "Window.h"
 #include "Camera.h"
-#include "Vector.h"
-#include "Matrix.h"
 #include "GameTimer.h"
 #include "Keyboard.h"
+#include "KeyboardMouseController.h"
+#include "Matrix.h"
 #include "Mouse.h"
+#include "Vector.h"
+#include "Window.h"
 
 #include "VulkanRenderer.h"
 #include "VulkanMesh.h"

@@ -29,6 +29,7 @@ GPUSceneManagement::GPUSceneManagement(Window& window, VulkanInitialisation& vkI
 	, m_isRecording(false), m_benchmarkComplete(false), m_currentFrame(0)
 	, m_monitor(nullptr), m_offscreenColour(nullptr), m_offscreenDepth(nullptr) {
 
+	m_vkInit.autoBeginDynamicRendering = false;
 	Initialise();
 	CreatePipelines();
 }
@@ -124,8 +125,6 @@ void GPUSceneManagement::UploadCameraUniform() {
 
 void GPUSceneManagement::SetBenchmarkConfig(const BenchmarkConfig& config) {
 	m_benchConfig = config;
-
-	m_vkInit.autoBeginDynamicRendering = false;
 
 	GenerateScene();
 	CreateBuffers();

@@ -130,8 +130,8 @@ protected:
 	void WriteCSVSummary();
 
 	VulkanInitialisation m_vkInit;
-	VulkanRenderer*      m_renderer;
-	VulkanMemoryManager* m_memoryManager;
+	VulkanRenderer*      m_renderer      = nullptr;
+	VulkanMemoryManager* m_memoryManager = nullptr;
 	Window&              m_hostWindow;
 
 	PerspectiveCamera m_camera;

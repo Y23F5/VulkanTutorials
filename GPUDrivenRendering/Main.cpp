@@ -6,8 +6,9 @@
 #include "GPUSceneManagement.h"
 
 #ifdef USE_IMGUI
-#include "Gui.h"
+#include "GuiWrapper.h"
 #include "imgui.h"
+#include "Win32Window.h"
 #endif
 
 using namespace NCL;
@@ -85,10 +86,10 @@ int main(int argc, char* argv[]) {
 	GPUSceneManagement app(*w, vkInit);
 
 #ifdef USE_IMGUI
-	Gui* gui = nullptr;
+	GuiWrapper* gui = nullptr;
 	if (!benchmarkMode) {
-		gui = new Gui();
-		gui->Init((HWND)w->GetHandle(), app.GetRenderer());
+		gui = new GuiWrapper();
+		gui->Init(static_cast<Win32Code::Win32Window*>(w)->GetHandle(), app.GetRenderer());
 	}
 #endif
 

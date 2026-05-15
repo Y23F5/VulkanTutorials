@@ -10,13 +10,13 @@
  * Two modes: interactive (window + optional ImGui monitor) and headless (-Benchmark).
  */
 #include "GPUSceneManagement.h"
-#include "WFCGenerator.h"
-#include "VulkanVMAMemoryManager.h"
 #include "MshLoader.h"
+#include "VulkanComputePipelineBuilder.h"
+#include "VulkanDescriptorSetLayoutBuilder.h"
+#include "VulkanVMAMemoryManager.h"
+#include "WFCGenerator.h"
 
-#ifdef USE_IMGUI
 #include "ChunkMonitor.h"
-#endif
 
 using namespace NCL;
 using namespace Rendering;
@@ -281,12 +281,12 @@ void GPUSceneManagement::WriteInstanceData() {
 	stagingChunk.Unmap();
 
 	vk::UniqueCommandBuffer cmd = CmdBufferCreateBegin(ctx.device, ctx.commandPools[CommandType::Graphics], "Upload");
-	cmd->copyBuffer(stagingCull.buffer, m_cullingBuffer.buffer, 1,
-		&vk::BufferCopy{0, 0, sizeof(CullingDatum) * m_totalInstances});
-	cmd->copyBuffer(stagingRender.buffer, m_renderBuffer.buffer, 1,
-		&vk::BufferCopy{0, 0, sizeof(RenderDatum) * m_totalInstances});
-	cmd->copyBuffer(stagingChunk.buffer, m_chunkBuffer.buffer, 1,
-		&vk::BufferCopy{0, 0, sizeof(ChunkInfo) * m_chunks.size()});
+	vk::BufferCopy copyCull{0, 0, sizeof(CullingDatum) * m_totalInstances};
+	cmd->copyBuffer(stagingCull.buffer, m_cullingBuffer.buffer, 1, &copyCull);
+	vk::BufferCopy copyRender{0, 0, sizeof(RenderDatum) * m_totalInstances};
+	cmd->copyBuffer(stagingRender.buffer, m_renderBuffer.buffer, 1, &copyRender);
+	vk::BufferCopy copyChunk{0, 0, sizeof(ChunkInfo) * m_chunks.size()};
+	cmd->copyBuffer(stagingChunk.buffer, m_chunkBuffer.buffer, 1, &copyChunk);
 	CmdBufferEndSubmitWait(*cmd, ctx.device, ctx.queues[CommandType::Graphics]);
 
 	m_memoryManager->DiscardBuffer(stagingCull, DiscardMode::Immediate);
@@ -339,18 +339,21 @@ void GPUSceneManagement::CreateDescriptorSets() {
 
 void GPUSceneManagement::ExtractFrustumPlanes(Vector4 planes[6]) const {
 	Matrix4 vp = m_camera.BuildProjectionMatrix(m_hostWindow.GetScreenAspect()) * m_camera.BuildViewMatrix();
+	const auto& m = vp.array;
 
-	planes[0] = Vector4(vp.values[3] + vp.values[0], vp.values[7] + vp.values[4],
-	                    vp.values[11] + vp.values[8], vp.values[15] + vp.values[12]);
-	planes[1] = Vector4(vp.values[3] - vp.values[0], vp.values[7] - vp.values[4],
-	                    vp.values[11] - vp.values[8], vp.values[15] - vp.values[12]);
-	planes[2] = Vector4(vp.values[3] + vp.values[1], vp.values[7] + vp.values[5],
-	                    vp.values[11] + vp.values[9], vp.values[15] + vp.values[13]);
-	planes[3] = Vector4(vp.values[3] - vp.values[1], vp.values[7] - vp.values[5],
-	                    vp.values[11] - vp.values[9], vp.values[15] - vp.values[13]);
-	planes[4] = Vector4(vp.values[2], vp.values[6], vp.values[10], vp.values[14]);
-	planes[5] = Vector4(vp.values[3] - vp.values[2], vp.values[7] - vp.values[6],
-	                    vp.values[11] - vp.values[10], vp.values[15] - vp.values[14]);
+	// Gribb-Hartmann: column-major matrix array[col][row]
+	// Left:   row3 + row0
+	planes[0] = Vector4(m[0][3] + m[0][0], m[1][3] + m[1][0], m[2][3] + m[2][0], m[3][3] + m[3][0]);
+	// Right:  row3 - row0
+	planes[1] = Vector4(m[0][3] - m[0][0], m[1][3] - m[1][0], m[2][3] - m[2][0], m[3][3] - m[3][0]);
+	// Bottom: row3 + row1
+	planes[2] = Vector4(m[0][3] + m[0][1], m[1][3] + m[1][1], m[2][3] + m[2][1], m[3][3] + m[3][1]);
+	// Top:    row3 - row1
+	planes[3] = Vector4(m[0][3] - m[0][1], m[1][3] - m[1][1], m[2][3] - m[2][1], m[3][3] - m[3][1]);
+	// Near:   row2
+	planes[4] = Vector4(m[0][2], m[1][2], m[2][2], m[3][2]);
+	// Far:    row3 - row2
+	planes[5] = Vector4(m[0][3] - m[0][2], m[1][3] - m[1][2], m[2][3] - m[2][2], m[3][3] - m[3][2]);
 
 	for (int i = 0; i < 6; ++i) {
 		float len = sqrt(planes[i].x * planes[i].x + planes[i].y * planes[i].y + planes[i].z * planes[i].z);
@@ -437,9 +440,11 @@ void GPUSceneManagement::RenderScheme2(float dt) {
 	}
 	m_indirectBuffer.Unmap();
 
-	vk::MemoryBarrier2 memBarrier(vk::PipelineStageFlagBits2::eHost,
-		vk::AccessFlagBits2::eHostWrite, vk::PipelineStageFlagBits2::eDrawIndirect,
-		vk::AccessFlagBits2::eIndirectCommandRead);
+	vk::MemoryBarrier2 memBarrier{};
+	memBarrier.srcStageMask  = vk::PipelineStageFlagBits2::eHost;
+	memBarrier.srcAccessMask = vk::AccessFlagBits2::eHostWrite;
+	memBarrier.dstStageMask  = vk::PipelineStageFlagBits2::eDrawIndirect;
+	memBarrier.dstAccessMask = vk::AccessFlagBits2::eIndirectCommandRead;
 	ctx.cmdBuffer.pipelineBarrier2(vk::DependencyInfo().setMemoryBarriers(memBarrier));
 
 	m_renderer->BeginRenderToScreen(ctx.cmdBuffer);
@@ -467,9 +472,11 @@ void GPUSceneManagement::RenderScheme3(float dt) {
 	uint32_t indirectSize = (uint32_t)m_chunks.size() * 2 * 5 * sizeof(uint32_t);
 	ctx.cmdBuffer.fillBuffer(m_indirectBuffer.buffer, 0, indirectSize, 0);
 
-	vk::BufferMemoryBarrier2 fillBarrier(vk::PipelineStageFlagBits2::eTransfer,
-		vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
-		vk::AccessFlagBits2::eShaderWrite);
+	vk::BufferMemoryBarrier2 fillBarrier{};
+	fillBarrier.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+	fillBarrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+	fillBarrier.dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+	fillBarrier.dstAccessMask = vk::AccessFlagBits2::eShaderWrite;
 	fillBarrier.buffer = m_indirectBuffer.buffer;
 	fillBarrier.size   = indirectSize;
 	ctx.cmdBuffer.pipelineBarrier2(vk::DependencyInfo().setBufferMemoryBarriers(fillBarrier));
@@ -490,9 +497,11 @@ void GPUSceneManagement::RenderScheme3(float dt) {
 		0, sizeof(push), &push);
 	ctx.cmdBuffer.dispatch(((uint32_t)m_chunks.size() + 63) / 64, 1, 1);
 
-	vk::BufferMemoryBarrier2 computeBarrier(vk::PipelineStageFlagBits2::eComputeShader,
-		vk::AccessFlagBits2::eShaderWrite, vk::PipelineStageFlagBits2::eDrawIndirect,
-		vk::AccessFlagBits2::eIndirectCommandRead);
+	vk::BufferMemoryBarrier2 computeBarrier{};
+	computeBarrier.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+	computeBarrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
+	computeBarrier.dstStageMask  = vk::PipelineStageFlagBits2::eDrawIndirect;
+	computeBarrier.dstAccessMask = vk::AccessFlagBits2::eIndirectCommandRead;
 	computeBarrier.buffer = m_indirectBuffer.buffer;
 	computeBarrier.size   = indirectSize;
 	ctx.cmdBuffer.pipelineBarrier2(vk::DependencyInfo().setBufferMemoryBarriers(computeBarrier));
@@ -553,7 +562,7 @@ void GPUSceneManagement::EndMeasurement() {
 		auto result = ctx.device.getQueryPoolResults<uint64_t>(*m_queryPool, 0, 2,
 			2 * sizeof(uint64_t), sizeof(uint64_t),
 			vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
-		uint64_t gpuNs = (result[1] - result[0]) * m_gpuTimestampPeriod;
+		uint64_t gpuNs = (result.value[1] - result.value[0]) * m_gpuTimestampPeriod;
 		m_frameStats.back().gpuTimeUs = gpuNs / 1000.0;
 
 		WriteCSVSummary();

@@ -57,6 +57,10 @@ endforeach()
 add_custom_target(GPUDrivenRendering_Shaders DEPENDS ${SHADER_OUTPUTS})
 add_dependencies(${TARGET_NAME} GPUDrivenRendering_Shaders)
 
+# Inject compatibility shim into VulkanRendering so its PipelineBuilderBase compiles with SDK 1.4.328+
+target_include_directories(VulkanRendering PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_options(VulkanRendering PRIVATE "/FI${CMAKE_CURRENT_SOURCE_DIR}/VulkanSDKCompat.h")
+
 target_link_libraries(${TARGET_NAME} PRIVATE
     NCLCoreClasses
     VulkanRendering

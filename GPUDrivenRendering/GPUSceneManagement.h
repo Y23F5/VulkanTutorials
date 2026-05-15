@@ -10,8 +10,14 @@
 #include <algorithm>
 #include <numeric>
 #include <cmath>
+#include <map>
+#include <chrono>
+#include <functional>
+#include <string>
 
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include "vulkan/vulkan.hpp"
 

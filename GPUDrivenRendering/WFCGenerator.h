@@ -53,6 +53,6 @@ private:
 		uint32_t gridSize, uint32_t changedX, uint32_t changedY);
 	bool IsValidAdjacency(uint32_t tileA, uint32_t tileB) const;
 
-	std::mt19937 m_rng;
+	mutable std::mt19937 m_rng;
 };
 }

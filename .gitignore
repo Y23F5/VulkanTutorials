@@ -378,3 +378,9 @@ MigrationBackup/
 /VulkanTutorials/cmake_install.cmake
 /VulkanTutorials/CMakeCache.txt
 /Assets/Shaders/VK/*.spv
+
+# Project management & tool config
+.claude/
+.superpowers/
+.workbench/
+*.md

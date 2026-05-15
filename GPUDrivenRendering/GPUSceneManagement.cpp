@@ -333,3 +333,180 @@ void GPUSceneManagement::CreateDescriptorSets() {
 	WriteBufferDescriptor(ctx.device, *m_computeDescriptor, 1, vk::DescriptorType::eStorageBuffer, m_indirectBuffer);
 }
 
+void GPUSceneManagement::ExtractFrustumPlanes(Vector4 planes[6]) const {
+	Matrix4 vp = m_camera.BuildProjectionMatrix(m_hostWindow.GetScreenAspect()) * m_camera.BuildViewMatrix();
+
+	planes[0] = Vector4(vp.values[3] + vp.values[0], vp.values[7] + vp.values[4],
+	                    vp.values[11] + vp.values[8], vp.values[15] + vp.values[12]);
+	planes[1] = Vector4(vp.values[3] - vp.values[0], vp.values[7] - vp.values[4],
+	                    vp.values[11] - vp.values[8], vp.values[15] - vp.values[12]);
+	planes[2] = Vector4(vp.values[3] + vp.values[1], vp.values[7] + vp.values[5],
+	                    vp.values[11] + vp.values[9], vp.values[15] + vp.values[13]);
+	planes[3] = Vector4(vp.values[3] - vp.values[1], vp.values[7] - vp.values[5],
+	                    vp.values[11] - vp.values[9], vp.values[15] - vp.values[13]);
+	planes[4] = Vector4(vp.values[2], vp.values[6], vp.values[10], vp.values[14]);
+	planes[5] = Vector4(vp.values[3] - vp.values[2], vp.values[7] - vp.values[6],
+	                    vp.values[11] - vp.values[10], vp.values[15] - vp.values[14]);
+
+	for (int i = 0; i < 6; ++i) {
+		float len = sqrt(planes[i].x * planes[i].x + planes[i].y * planes[i].y + planes[i].z * planes[i].z);
+		if (len > 0.0f) planes[i] = planes[i] / len;
+	}
+}
+
+static bool AABBInFrustum(const Vector4 planes[6], float minX, float minY, float minZ,
+                          float maxX, float maxY, float maxZ) {
+	for (int i = 0; i < 6; ++i) {
+		Vector3 p(planes[i].x > 0 ? maxX : minX,
+		          planes[i].y > 0 ? maxY : minY,
+		          planes[i].z > 0 ? maxZ : minZ);
+		if (Vector3::Dot(Vector3(planes[i].x, planes[i].y, planes[i].z), p) + planes[i].w < 0)
+			return false;
+	}
+	return true;
+}
+
+void GPUSceneManagement::RenderScheme1(float dt) {
+	FrameContext const& ctx = m_renderer->GetFrameContext();
+	BeginMeasurement();
+
+	Vector4 frustumPlanes[6];
+	ExtractFrustumPlanes(frustumPlanes);
+
+	for (uint32_t i = 0; i < m_chunks.size(); ++i) {
+		const auto& chunk = m_chunks[i];
+		m_chunkVisible[i] = AABBInFrustum(frustumPlanes,
+			chunk.aabbMinX, chunk.aabbMinY, chunk.aabbMinZ,
+			chunk.aabbMaxX, chunk.aabbMaxY, chunk.aabbMaxZ);
+	}
+
+	m_renderer->BeginRenderToScreen(ctx.cmdBuffer);
+	ctx.cmdBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, m_graphicsPipeline);
+	ctx.cmdBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *m_graphicsPipeline.layout,
+		0, 1, &*m_sceneDescriptor, 0, nullptr);
+
+	for (uint32_t i = 0; i < m_chunks.size(); ++i) {
+		if (!m_chunkVisible[i] || m_chunks[i].instanceCount == 0) continue;
+		const auto& chunk = m_chunks[i];
+
+		if (chunk.cubeCount > 0) {
+			m_cubeMesh->BindToCommandBuffer(ctx.cmdBuffer);
+			ctx.cmdBuffer.drawIndexed(m_cubeIndexCount, chunk.cubeCount, 0, 0, chunk.instanceOffset);
+		}
+		if (chunk.sphereCount > 0) {
+			m_sphereMesh->BindToCommandBuffer(ctx.cmdBuffer);
+			ctx.cmdBuffer.drawIndexed(m_sphereIndexCount, chunk.sphereCount, 0, 0,
+				chunk.instanceOffset + chunk.cubeCount);
+		}
+	}
+
+	ctx.cmdBuffer.endRendering();
+	EndMeasurement();
+}
+
+void GPUSceneManagement::RenderScheme2(float dt) {
+	FrameContext const& ctx = m_renderer->GetFrameContext();
+	BeginMeasurement();
+
+	Vector4 frustumPlanes[6];
+	ExtractFrustumPlanes(frustumPlanes);
+
+	uint32_t* indirectMap = m_indirectBuffer.Map<uint32_t>();
+	for (uint32_t i = 0; i < m_chunks.size(); ++i) {
+		const auto& chunk = m_chunks[i];
+		m_chunkVisible[i] = AABBInFrustum(frustumPlanes,
+			chunk.aabbMinX, chunk.aabbMinY, chunk.aabbMinZ,
+			chunk.aabbMaxX, chunk.aabbMaxY, chunk.aabbMaxZ);
+
+		uint32_t base = i * 2 * 5;
+		indirectMap[base + 0] = m_cubeIndexCount;
+		indirectMap[base + 1] = (m_chunkVisible[i] && chunk.cubeCount > 0) ? chunk.cubeCount : 0;
+		indirectMap[base + 2] = 0;
+		indirectMap[base + 3] = 0;
+		indirectMap[base + 4] = chunk.instanceOffset;
+
+		indirectMap[base + 5] = m_sphereIndexCount;
+		indirectMap[base + 6] = (m_chunkVisible[i] && chunk.sphereCount > 0) ? chunk.sphereCount : 0;
+		indirectMap[base + 7] = 0;
+		indirectMap[base + 8] = 0;
+		indirectMap[base + 9] = chunk.instanceOffset + chunk.cubeCount;
+	}
+	m_indirectBuffer.Unmap();
+
+	vk::MemoryBarrier2 memBarrier(vk::PipelineStageFlagBits2::eHost,
+		vk::AccessFlagBits2::eHostWrite, vk::PipelineStageFlagBits2::eDrawIndirect,
+		vk::AccessFlagBits2::eIndirectCommandRead);
+	ctx.cmdBuffer.pipelineBarrier2(vk::DependencyInfo().setMemoryBarriers(memBarrier));
+
+	m_renderer->BeginRenderToScreen(ctx.cmdBuffer);
+	ctx.cmdBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, m_graphicsPipeline);
+	ctx.cmdBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *m_graphicsPipeline.layout,
+		0, 1, &*m_sceneDescriptor, 0, nullptr);
+
+	uint32_t stride    = 2 * 5 * sizeof(uint32_t);
+	uint32_t drawCount = (uint32_t)m_chunks.size();
+
+	m_cubeMesh->BindToCommandBuffer(ctx.cmdBuffer);
+	ctx.cmdBuffer.drawIndexedIndirect(m_indirectBuffer.buffer, 0, drawCount, stride);
+
+	m_sphereMesh->BindToCommandBuffer(ctx.cmdBuffer);
+	ctx.cmdBuffer.drawIndexedIndirect(m_indirectBuffer.buffer, 5 * sizeof(uint32_t), drawCount, stride);
+
+	ctx.cmdBuffer.endRendering();
+	EndMeasurement();
+}
+
+void GPUSceneManagement::RenderScheme3(float dt) {
+	FrameContext const& ctx = m_renderer->GetFrameContext();
+	BeginMeasurement();
+
+	uint32_t indirectSize = (uint32_t)m_chunks.size() * 2 * 5 * sizeof(uint32_t);
+	ctx.cmdBuffer.fillBuffer(m_indirectBuffer.buffer, 0, indirectSize, 0);
+
+	vk::BufferMemoryBarrier2 fillBarrier(vk::PipelineStageFlagBits2::eTransfer,
+		vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
+		vk::AccessFlagBits2::eShaderWrite);
+	fillBarrier.buffer = m_indirectBuffer.buffer;
+	fillBarrier.size   = indirectSize;
+	ctx.cmdBuffer.pipelineBarrier2(vk::DependencyInfo().setBufferMemoryBarriers(fillBarrier));
+
+	Vector4 frustumPlanes[6];
+	ExtractFrustumPlanes(frustumPlanes);
+
+	struct { Vector4 planes[6]; uint32_t numChunks, cubeIndexCount, sphereIndexCount; } push;
+	memcpy(push.planes, frustumPlanes, sizeof(frustumPlanes));
+	push.numChunks       = (uint32_t)m_chunks.size();
+	push.cubeIndexCount  = m_cubeIndexCount;
+	push.sphereIndexCount = m_sphereIndexCount;
+
+	ctx.cmdBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, m_computePipeline);
+	ctx.cmdBuffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *m_computePipeline.layout,
+		0, 1, &*m_computeDescriptor, 0, nullptr);
+	ctx.cmdBuffer.pushConstants(*m_computePipeline.layout, vk::ShaderStageFlagBits::eCompute,
+		0, sizeof(push), &push);
+	ctx.cmdBuffer.dispatch(((uint32_t)m_chunks.size() + 63) / 64, 1, 1);
+
+	vk::BufferMemoryBarrier2 computeBarrier(vk::PipelineStageFlagBits2::eComputeShader,
+		vk::AccessFlagBits2::eShaderWrite, vk::PipelineStageFlagBits2::eDrawIndirect,
+		vk::AccessFlagBits2::eIndirectCommandRead);
+	computeBarrier.buffer = m_indirectBuffer.buffer;
+	computeBarrier.size   = indirectSize;
+	ctx.cmdBuffer.pipelineBarrier2(vk::DependencyInfo().setBufferMemoryBarriers(computeBarrier));
+
+	m_renderer->BeginRenderToScreen(ctx.cmdBuffer);
+	ctx.cmdBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, m_graphicsPipeline);
+	ctx.cmdBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *m_graphicsPipeline.layout,
+		0, 1, &*m_sceneDescriptor, 0, nullptr);
+
+	uint32_t stride    = 2 * 5 * sizeof(uint32_t);
+	uint32_t drawCount = (uint32_t)m_chunks.size();
+
+	m_cubeMesh->BindToCommandBuffer(ctx.cmdBuffer);
+	ctx.cmdBuffer.drawIndexedIndirect(m_indirectBuffer.buffer, 0, drawCount, stride);
+
+	m_sphereMesh->BindToCommandBuffer(ctx.cmdBuffer);
+	ctx.cmdBuffer.drawIndexedIndirect(m_indirectBuffer.buffer, 5 * sizeof(uint32_t), drawCount, stride);
+
+	ctx.cmdBuffer.endRendering();
+	EndMeasurement();
+}

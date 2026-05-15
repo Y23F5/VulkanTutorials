@@ -3,6 +3,8 @@
  * Green = visible/populated, Red = culled/populated, Dark violet = empty.
  */
 #include "ChunkMonitor.h"
+
+#ifdef USE_IMGUI
 #include "imgui.h"
 
 ChunkMonitor::ChunkMonitor(uint32_t gridChunks, uint32_t chunkSize, uint32_t gridSize)
@@ -76,3 +78,12 @@ void ChunkMonitor::Render() {
 
 	ImGui::End();
 }
+
+#else
+
+ChunkMonitor::ChunkMonitor(uint32_t, uint32_t, uint32_t) {}
+ChunkMonitor::~ChunkMonitor() {}
+void ChunkMonitor::Update(const ChunkMonitorCell*, uint32_t&, uint32_t&) {}
+void ChunkMonitor::Render() {}
+
+#endif

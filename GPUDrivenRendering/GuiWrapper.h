@@ -32,6 +32,7 @@ class GuiWrapper {
 public:
 	void Init(HWND window, VulkanRenderer* renderer);
 	void StartNewFrame();
+	void SyncInput(HWND hwnd);
 	void Render(vk::CommandBuffer cmdBuffer);
 	void Destroy();
 

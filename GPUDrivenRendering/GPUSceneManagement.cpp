@@ -17,6 +17,7 @@
 #include "WFCGenerator.h"
 
 #include "ChunkMonitor.h"
+#include "Win32Window.h"
 
 using namespace NCL;
 using namespace Rendering;
@@ -142,16 +143,26 @@ void GPUSceneManagement::RunFrame(float dt) {
 	if (m_hostWindow.IsMinimised()) return;
 
 	bool altHeld = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+	HWND hwnd = static_cast<Win32Code::Win32Window&>(m_hostWindow).GetHandle();
 
 	m_renderer->BeginFrame();
 
 	if (altHeld) {
 		ShowCursor(TRUE);
+		ClipCursor(nullptr);
 	} else {
 		ShowCursor(FALSE);
+		RECT r;
+		GetClientRect(hwnd, &r);
+		POINT tl{ r.left, r.top };
+		POINT br{ r.right, r.bottom };
+		ClientToScreen(hwnd, &tl);
+		ClientToScreen(hwnd, &br);
+		RECT clip{ tl.x, tl.y, br.x, br.y };
+		ClipCursor(&clip);
 		m_controller.Update(dt);
+		m_camera.UpdateCamera(dt);
 	}
-	m_camera.UpdateCamera(dt);
 	UploadCameraUniform();
 	m_memoryManager->Update();
 
@@ -168,6 +179,7 @@ void GPUSceneManagement::RunFrame(float dt) {
 		else
 			ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NoMouse;
 		m_gui->StartNewFrame();
+		m_gui->SyncInput(hwnd);
 		ImGui::ShowDemoWindow(nullptr);
 		ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
 		ImGui::Begin("GPU-Driven Scene Management");

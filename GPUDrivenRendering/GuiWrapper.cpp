@@ -69,6 +69,35 @@ void GuiWrapper::Init(HWND window, VulkanRenderer* renderer) {
 	ImGui_ImplVulkan_Init(&info);
 }
 
+void GuiWrapper::SyncInput(HWND hwnd) {
+	ImGuiIO& io = ImGui::GetIO();
+
+	POINT p;
+	GetCursorPos(&p);
+	ScreenToClient(hwnd, &p);
+	io.AddMousePosEvent((float)p.x, (float)p.y);
+
+	const Mouse* mouse = Window::GetMouse();
+	static bool prevL, prevR, prevM;
+	bool curL = mouse->ButtonDown(NCL::MouseButtons::Left);
+	bool curR = mouse->ButtonDown(NCL::MouseButtons::Right);
+	bool curM = mouse->ButtonDown(NCL::MouseButtons::Middle);
+	if (curL != prevL) io.AddMouseButtonEvent(0, curL);
+	if (curR != prevR) io.AddMouseButtonEvent(1, curR);
+	if (curM != prevM) io.AddMouseButtonEvent(2, curM);
+	prevL = curL; prevR = curR; prevM = curM;
+
+	const Keyboard* kb = Window::GetKeyboard();
+	static bool prevCtrl, prevShift, prevAlt;
+	bool curCtrl  = kb->KeyDown(KeyCodes::CONTROL);
+	bool curShift = kb->KeyDown(KeyCodes::SHIFT);
+	bool curAlt   = kb->KeyDown(KeyCodes::MENU);
+	if (curCtrl  != prevCtrl)  io.AddKeyEvent(ImGuiMod_Ctrl,  curCtrl);
+	if (curShift != prevShift) io.AddKeyEvent(ImGuiMod_Shift, curShift);
+	if (curAlt   != prevAlt)   io.AddKeyEvent(ImGuiMod_Alt,   curAlt);
+	prevCtrl = curCtrl; prevShift = curShift; prevAlt = curAlt;
+}
+
 void GuiWrapper::StartNewFrame() {
 	ImGui_ImplVulkan_NewFrame();
 	ImGui_ImplWin32_NewFrame();

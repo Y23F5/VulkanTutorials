@@ -156,6 +156,7 @@ void GPUSceneManagement::RunFrame(float dt) {
 #ifdef USE_IMGUI
 	if (m_gui) {
 		m_gui->StartNewFrame();
+		ImGui::ShowDemoWindow(nullptr);
 		ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
 		ImGui::Begin("GPU-Driven Scene Management");
 		ImGui::Text("Scheme: %d  Frame: %u  Instances: %u  Chunks: %zu",

@@ -16,6 +16,7 @@
 #include <memory>
 #include <cstdio>
 #include <cstdlib>
+#include <iostream>
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif

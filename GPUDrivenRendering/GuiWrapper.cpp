@@ -17,6 +17,7 @@ static void check_vk_result(VkResult err) {
 }
 
 void GuiWrapper::Init(HWND window, VulkanRenderer* renderer) {
+	std::cout << "[GuiWrapper] Init called\n";
 	m_renderer = renderer;
 	IMGUI_CHECKVERSION();
 	ImGui::CreateContext();

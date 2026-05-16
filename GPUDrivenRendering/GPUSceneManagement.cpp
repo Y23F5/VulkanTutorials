@@ -148,11 +148,10 @@ void GPUSceneManagement::RunFrame(float dt) {
 	if (altHeld != m_altWasHeld) {
 		m_altWasHeld = altHeld;
 		if (altHeld) {
-			ShowCursor(TRUE);
+			SetClassLongPtr(hwnd, GCLP_HCURSOR, (LONG_PTR)LoadCursor(NULL, IDC_ARROW));
 			ClipCursor(nullptr);
-			while (ShowCursor(TRUE) < 0);
 		} else {
-			while (ShowCursor(FALSE) >= 0);
+			SetClassLongPtr(hwnd, GCLP_HCURSOR, (LONG_PTR)NULL);
 			RECT r; GetClientRect(hwnd, &r);
 			POINT tl{ r.left, r.top }, br{ r.right, r.bottom };
 			ClientToScreen(hwnd, &tl);

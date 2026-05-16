@@ -82,8 +82,8 @@ void GPUSceneManagement::Initialise() {
 	m_queryPool = ctx.device.createQueryPoolUnique(qpCreate);
 
 	m_camera.SetFieldOfVision(45.0f).SetNearPlane(0.1f).SetFarPlane(2000.0f);
-	m_camera.SetPosition(Vector3(128, 64, -128));
-	m_camera.SetPitch(-55.0f).SetYaw(180.0f);
+	m_camera.SetPosition(Vector3(128, 120, -200));
+	m_camera.SetPitch(-35.0f).SetYaw(180.0f);
 	m_camera.SetController(m_controller);
 
 	m_controller.MapAxis(0, "Sidestep");
@@ -134,8 +134,8 @@ void GPUSceneManagement::SetBenchmarkConfig(const BenchmarkConfig& config) {
 	CreateDescriptorSets();
 
 	float sceneSize = m_benchConfig.gridSize * 2.0f;
-	m_camera.SetPosition(Vector3(sceneSize * 0.5f, sceneSize * 0.25f, -sceneSize * 0.5f));
-	m_camera.SetPitch(-55.0f).SetYaw(180.0f);
+	m_camera.SetPosition(Vector3(sceneSize * 0.5f, sceneSize * 0.4f, -sceneSize * 0.7f));
+	m_camera.SetPitch(-35.0f).SetYaw(180.0f);
 }
 
 void GPUSceneManagement::RunFrame(float dt) {

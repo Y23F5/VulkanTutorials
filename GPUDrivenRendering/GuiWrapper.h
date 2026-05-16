@@ -24,6 +24,7 @@
 #include "vulkan/vulkan.hpp"
 #include "imgui.h"
 #include "VulkanRenderer.h"
+#include "VulkanUtils.h"
 
 namespace NCL::Rendering::Vulkan {
 

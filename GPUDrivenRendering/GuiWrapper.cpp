@@ -57,6 +57,7 @@ void GuiWrapper::Init(HWND window, VulkanRenderer* renderer) {
 	info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
 
 	ImGui_ImplWin32_Init((void*)window);
+	io.BackendFlags &= ~ImGuiBackendFlags_PlatformHasViewports; // single-window only, no multi-viewport
 	VkInstance vkInstance = static_cast<VkInstance>(renderer->GetVulkanInstance());
 	PFN_vkGetInstanceProcAddr gipa = dynamicLoader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr");
 	auto loadCtx = std::make_pair(gipa, vkInstance);

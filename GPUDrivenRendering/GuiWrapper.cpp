@@ -57,10 +57,13 @@ void GuiWrapper::Init(HWND window, VulkanRenderer* renderer) {
 	info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
 
 	ImGui_ImplWin32_Init((void*)window);
+	VkInstance vkInstance = static_cast<VkInstance>(renderer->GetVulkanInstance());
 	PFN_vkGetInstanceProcAddr gipa = dynamicLoader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr");
+	auto loadCtx = std::make_pair(gipa, vkInstance);
 	ImGui_ImplVulkan_LoadFunctions(VK_API_VERSION_1_3, [](const char* name, void* user) -> PFN_vkVoidFunction {
-		return ((PFN_vkGetInstanceProcAddr)user)(VK_NULL_HANDLE, name);
-	}, (void*)gipa);
+		auto p = (std::pair<PFN_vkGetInstanceProcAddr, VkInstance>*)user;
+		return p->first(p->second, name);
+	}, &loadCtx);
 	ImGui_ImplVulkan_Init(&info);
 }
 

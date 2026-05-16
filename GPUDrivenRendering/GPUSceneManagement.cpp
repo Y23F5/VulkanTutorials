@@ -142,7 +142,7 @@ void GPUSceneManagement::SetBenchmarkConfig(const BenchmarkConfig& config) {
 void GPUSceneManagement::RunFrame(float dt) {
 	if (m_hostWindow.IsMinimised()) return;
 
-	bool altHeld = Window::GetKeyboard()->KeyDown(KeyCodes::MENU);
+	bool altHeld = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
 	HWND hwnd = static_cast<Win32Code::Win32Window&>(m_hostWindow).GetHandle();
 
 	if (altHeld != m_altWasHeld) {

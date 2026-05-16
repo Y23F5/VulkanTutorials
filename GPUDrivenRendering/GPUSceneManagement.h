@@ -190,6 +190,7 @@ protected:
 #ifdef USE_IMGUI
 	GuiWrapper* m_gui = nullptr;
 #endif
+	bool m_altWasHeld = false;
 
 	VulkanTexture* m_offscreenColour;
 	VulkanTexture* m_offscreenDepth;

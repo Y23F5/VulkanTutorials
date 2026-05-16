@@ -142,24 +142,29 @@ void GPUSceneManagement::SetBenchmarkConfig(const BenchmarkConfig& config) {
 void GPUSceneManagement::RunFrame(float dt) {
 	if (m_hostWindow.IsMinimised()) return;
 
-	bool altHeld = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+	bool altHeld = Window::GetKeyboard()->KeyDown(KeyCodes::MENU);
 	HWND hwnd = static_cast<Win32Code::Win32Window&>(m_hostWindow).GetHandle();
+
+	if (altHeld != m_altWasHeld) {
+		m_altWasHeld = altHeld;
+		if (altHeld) {
+			ShowCursor(TRUE);
+			ClipCursor(nullptr);
+			while (ShowCursor(TRUE) < 0);
+		} else {
+			while (ShowCursor(FALSE) >= 0);
+			RECT r; GetClientRect(hwnd, &r);
+			POINT tl{ r.left, r.top }, br{ r.right, r.bottom };
+			ClientToScreen(hwnd, &tl);
+			ClientToScreen(hwnd, &br);
+			RECT clip{ tl.x, tl.y, br.x, br.y };
+			ClipCursor(&clip);
+		}
+	}
 
 	m_renderer->BeginFrame();
 
-	if (altHeld) {
-		ShowCursor(TRUE);
-		ClipCursor(nullptr);
-	} else {
-		ShowCursor(FALSE);
-		RECT r;
-		GetClientRect(hwnd, &r);
-		POINT tl{ r.left, r.top };
-		POINT br{ r.right, r.bottom };
-		ClientToScreen(hwnd, &tl);
-		ClientToScreen(hwnd, &br);
-		RECT clip{ tl.x, tl.y, br.x, br.y };
-		ClipCursor(&clip);
+	if (!altHeld) {
 		m_controller.Update(dt);
 		m_camera.UpdateCamera(dt);
 	}

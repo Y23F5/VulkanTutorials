@@ -90,6 +90,7 @@ int main(int argc, char* argv[]) {
 	if (!benchmarkMode) {
 		gui = new GuiWrapper();
 		gui->Init(static_cast<Win32Code::Win32Window*>(w)->GetHandle(), app.GetRenderer());
+		app.SetGui(gui);
 	}
 #endif
 
@@ -109,9 +110,6 @@ int main(int argc, char* argv[]) {
 			app.SetBenchmarkConfig(benchConfig);
 		}
 		while (w->UpdateWindow() && !Window::GetKeyboard()->KeyDown(KeyCodes::ESCAPE)) {
-#ifdef USE_IMGUI
-			if (gui) gui->StartNewFrame();
-#endif
 			app.RunFrame(w->GetTimer().GetTimeDeltaSeconds());
 
 			if (Window::GetKeyboard()->KeyPressed(KeyCodes::NUM1))
@@ -121,12 +119,6 @@ int main(int argc, char* argv[]) {
 			if (Window::GetKeyboard()->KeyPressed(KeyCodes::NUM3))
 				app.SetScheme(RenderScheme::GPU_CullIndirect);
 
-#ifdef USE_IMGUI
-			if (gui) {
-				FrameContext const& ctx = app.GetRenderer()->GetFrameContext();
-				gui->Render(ctx.cmdBuffer);
-			}
-#endif
 		}
 		app.Finish();
 	}

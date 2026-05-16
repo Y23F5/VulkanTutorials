@@ -38,6 +38,10 @@
 #include "VulkanUtils.h"
 #include "VulkanMemoryManager.h"
 
+#ifdef USE_IMGUI
+#include "GuiWrapper.h"
+#endif
+
 using namespace NCL;
 using namespace Rendering;
 using namespace Vulkan;
@@ -104,6 +108,9 @@ public:
 	VulkanRenderer* GetRenderer() { return m_renderer; }
 	const BenchmarkConfig& GetBenchmarkConfig() const { return m_benchConfig; }
 	void SetScheme(RenderScheme s) { m_benchConfig.scheme = s; }
+#ifdef USE_IMGUI
+	void SetGui(GuiWrapper* gui) { m_gui = gui; }
+#endif
 
 protected:
 	void Initialise();
@@ -179,7 +186,10 @@ protected:
 	LARGE_INTEGER m_qpcFrequency;
 	LARGE_INTEGER m_frameStartQpc;
 
-	class ChunkMonitor* m_monitor;
+	class ChunkMonitor* m_monitor = nullptr;
+#ifdef USE_IMGUI
+	GuiWrapper* m_gui = nullptr;
+#endif
 
 	VulkanTexture* m_offscreenColour;
 	VulkanTexture* m_offscreenDepth;

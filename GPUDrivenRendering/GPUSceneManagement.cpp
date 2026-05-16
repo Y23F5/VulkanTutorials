@@ -153,6 +153,24 @@ void GPUSceneManagement::RunFrame(float dt) {
 		case RenderScheme::GPU_CullIndirect: RenderScheme3(dt); break;
 	}
 
+#ifdef USE_IMGUI
+	if (m_gui) {
+		m_gui->StartNewFrame();
+		ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
+		ImGui::Begin("GPU-Driven Scene Management");
+		ImGui::Text("Scheme: %d  Frame: %u  Instances: %u  Chunks: %zu",
+			(int)m_benchConfig.scheme, m_currentFrame,
+			m_totalInstances, m_chunks.size());
+		ImGui::Separator();
+		ImGui::Text("Camera: %.1f, %.1f, %.1f  Pitch: %.1f  Yaw: %.1f",
+			m_camera.GetPosition().x, m_camera.GetPosition().y, m_camera.GetPosition().z,
+			m_camera.GetPitch(), m_camera.GetYaw());
+		ImGui::End();
+		FrameContext const& ctx = m_renderer->GetFrameContext();
+		m_gui->Render(ctx.cmdBuffer);
+	}
+#endif
+
 	m_renderer->EndFrame();
 	m_renderer->SwapBuffers();
 

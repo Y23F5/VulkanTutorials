@@ -141,8 +141,16 @@ void GPUSceneManagement::SetBenchmarkConfig(const BenchmarkConfig& config) {
 void GPUSceneManagement::RunFrame(float dt) {
 	if (m_hostWindow.IsMinimised()) return;
 
+	bool altHeld = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+
 	m_renderer->BeginFrame();
-	m_controller.Update(dt);
+
+	if (altHeld) {
+		ShowCursor(TRUE);
+	} else {
+		ShowCursor(FALSE);
+		m_controller.Update(dt);
+	}
 	m_camera.UpdateCamera(dt);
 	UploadCameraUniform();
 	m_memoryManager->Update();
@@ -155,6 +163,10 @@ void GPUSceneManagement::RunFrame(float dt) {
 
 #ifdef USE_IMGUI
 	if (m_gui) {
+		if (altHeld)
+			ImGui::GetIO().ConfigFlags &= ~ImGuiConfigFlags_NoMouse;
+		else
+			ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NoMouse;
 		m_gui->StartNewFrame();
 		ImGui::ShowDemoWindow(nullptr);
 		ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);

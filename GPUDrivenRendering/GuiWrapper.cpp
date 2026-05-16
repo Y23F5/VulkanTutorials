@@ -27,6 +27,7 @@ void GuiWrapper::Init(HWND window, VulkanRenderer* renderer) {
 		(float)std::abs(renderer->GetFrameContext().viewport.height));
 	io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 	io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+	io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
 
 	ImGui::StyleColorsDark();
 

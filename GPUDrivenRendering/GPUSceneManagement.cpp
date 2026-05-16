@@ -143,30 +143,30 @@ void GPUSceneManagement::RunFrame(float dt) {
 	if (m_hostWindow.IsMinimised()) return;
 
 	bool altHeld = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
-	HWND hwnd = static_cast<Win32Code::Win32Window&>(m_hostWindow).GetHandle();
 
+	// cursor + clip on state transition
 	if (altHeld != m_altWasHeld) {
 		m_altWasHeld = altHeld;
+		HWND hwnd = static_cast<Win32Code::Win32Window&>(m_hostWindow).GetHandle();
 		if (altHeld) {
-			SetClassLongPtr(hwnd, GCLP_HCURSOR, (LONG_PTR)LoadCursor(NULL, IDC_ARROW));
+			ShowCursor(TRUE);
 			ClipCursor(nullptr);
 		} else {
-			SetClassLongPtr(hwnd, GCLP_HCURSOR, (LONG_PTR)NULL);
+			ShowCursor(FALSE);
 			RECT r; GetClientRect(hwnd, &r);
 			POINT tl{ r.left, r.top }, br{ r.right, r.bottom };
 			ClientToScreen(hwnd, &tl);
 			ClientToScreen(hwnd, &br);
-			RECT clip{ tl.x, tl.y, br.x, br.y };
-			ClipCursor(&clip);
+			RECT cr{ tl.x, tl.y, br.x, br.y };
+				ClipCursor(&cr);
 		}
 	}
 
 	m_renderer->BeginFrame();
 
-	if (!altHeld) {
-		m_controller.Update(dt);
+	if (!altHeld)
 		m_camera.UpdateCamera(dt);
-	}
+
 	UploadCameraUniform();
 	m_memoryManager->Update();
 
@@ -178,13 +178,14 @@ void GPUSceneManagement::RunFrame(float dt) {
 
 #ifdef USE_IMGUI
 	if (m_gui) {
-		if (altHeld)
+		if (altHeld) {
 			ImGui::GetIO().ConfigFlags &= ~ImGuiConfigFlags_NoMouse;
-		else
+			HWND hwnd = static_cast<Win32Code::Win32Window&>(m_hostWindow).GetHandle();
+			m_gui->SyncInput(hwnd);
+		} else {
 			ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NoMouse;
+		}
 		m_gui->StartNewFrame();
-		m_gui->SyncInput(hwnd);
-		ImGui::ShowDemoWindow(nullptr);
 		ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
 		ImGui::Begin("GPU-Driven Scene Management");
 		ImGui::Text("Scheme: %d  Frame: %u  Instances: %u  Chunks: %zu",

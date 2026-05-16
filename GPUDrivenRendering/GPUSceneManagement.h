@@ -187,10 +187,10 @@ protected:
 	LARGE_INTEGER m_frameStartQpc;
 
 	class ChunkMonitor* m_monitor = nullptr;
+	bool m_altWasHeld = false;
 #ifdef USE_IMGUI
 	GuiWrapper* m_gui = nullptr;
 #endif
-	bool m_altWasHeld = false;
 
 	VulkanTexture* m_offscreenColour;
 	VulkanTexture* m_offscreenDepth;

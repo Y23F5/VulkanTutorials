@@ -4,16 +4,18 @@
  */
 #include "WFCGenerator.h"
 #include <algorithm>
+#include <queue>
+#include <cstdint>
 
 using namespace NCL::Rendering::Vulkan;
 
 static const WFCTile s_tiles[] = {
-	{ 0, "EMPTY",    false, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f },
-	{ 1, "LOW",      true,  0.4f, 0.8f, 1.0f, 0.204f, 0.596f, 0.859f },
-	{ 2, "MID",      true,  1.2f, 2.0f, 1.0f, 0.180f, 0.800f, 0.443f },
-	{ 3, "HIGH",     true,  3.0f, 5.0f, 1.0f, 0.906f, 0.298f, 0.235f },
-	{ 4, "SPHERE_S", false, 0.3f, 0.6f, 0.5f, 0.953f, 0.612f, 0.071f },
-	{ 5, "SPHERE_L", false, 0.8f, 1.5f, 0.8f, 0.608f, 0.349f, 0.714f },
+	{ 0, "EMPTY",    false,  0.0f,  0.0f, 0.0f, 0.0f, 0.0f, 0.0f },
+	{ 1, "LOW",      true,   1.5f,  3.0f, 1.0f, 0.204f, 0.596f, 0.859f },
+	{ 2, "MID",      true,   4.0f,  8.0f, 1.0f, 0.180f, 0.800f, 0.443f },
+	{ 3, "HIGH",     true,  12.0f, 20.0f, 1.0f, 0.906f, 0.298f, 0.235f },
+	{ 4, "SPHERE_S", false,  1.0f,  2.0f, 0.5f, 0.953f, 0.612f, 0.071f },
+	{ 5, "SPHERE_L", false,  3.0f,  5.0f, 0.8f, 0.608f, 0.349f, 0.714f },
 };
 
 static const bool s_adjacency[6][6] = {
@@ -42,23 +44,36 @@ std::vector<uint32_t> WFCGenerator::Generate(const WFCConfig& config) {
 	std::vector<std::vector<uint32_t>> possibilities(total);
 	std::vector<float> weights(kTileCount);
 	weights[0] = config.emptyWeight;
-	for (uint32_t i = 1; i < kTileCount; ++i) weights[i] = config.otherWeight;
+	for (uint32_t i = 1; i < kTileCount; ++i) {
+		float w = config.otherWeight;
+		if (s_tiles[i].isCube && config.cubeWeight >= 0.0f) w = config.cubeWeight;
+		if (!s_tiles[i].isCube && config.sphereWeight >= 0.0f) w = config.sphereWeight;
+		weights[i] = w;
+	}
 
 	std::vector<uint32_t> allTiles(kTileCount);
 	for (uint32_t i = 0; i < kTileCount; ++i) allTiles[i] = i;
 	for (uint32_t i = 0; i < total; ++i) possibilities[i] = allTiles;
 
-	for (uint32_t iter = 0; iter < total; ++iter) {
-		uint32_t bestIdx = 0;
-		size_t bestCount = kTileCount + 1;
-		for (uint32_t i = 0; i < total; ++i) {
-			size_t count = possibilities[i].size();
-			if (count > 1 && count < bestCount) {
-				bestCount = count;
-				bestIdx = i;
-			}
-		}
-		if (bestCount > kTileCount) break;
+	// Min-heap of (possibility count, index). Replaces the O(N^2) full scan
+	// per iteration with O(log N) top extraction — total O(N^2 log N).
+	// Lazy deletion: Propagate pushes updated (smaller-count) entries; stale
+	// entries whose count != current possibilities[idx].size() are skipped.
+	// (count, index) ordering with std::greater reproduces the original
+	// "smallest count, ties by smallest index" tie-break exactly.
+	CellHeap heap;
+	for (uint32_t i = 0; i < total; ++i)
+		heap.push({ (uint32_t)possibilities[i].size(), i });
+
+	uint32_t iter = 0;
+	while (!heap.empty()) {
+		auto [entryCount, bestIdx] = heap.top();
+		heap.pop();
+
+		// Skip stale entries (count no longer matches) and already-collapsed
+		// or fully-constrained cells (count <= 1 are not collapse candidates).
+		if (entryCount != (uint32_t)possibilities[bestIdx].size()) continue;
+		if (possibilities[bestIdx].size() <= 1) continue;
 
 		float totalWeight = 0.0f;
 		for (uint32_t t : possibilities[bestIdx]) totalWeight += weights[t];
@@ -73,14 +88,29 @@ std::vector<uint32_t> WFCGenerator::Generate(const WFCConfig& config) {
 
 		possibilities[bestIdx] = { chosen };
 		grid[bestIdx] = chosen;
-		Propagate(possibilities, N, bestIdx % N, bestIdx / N);
+		Propagate(possibilities, N, bestIdx % N, bestIdx / N, heap);
+
+		if (config.partialGrid && config.gridMutex && (iter % 200 == 0)) {
+			std::lock_guard<std::mutex> lock(*config.gridMutex);
+			*config.partialGrid = grid;
+		}
+		if (config.onProgress && (iter % 500 == 0)) {
+			config.onProgress(iter + 1, total);
+		}
+		++iter;
 	}
+
+	if (config.partialGrid && config.gridMutex) {
+		std::lock_guard<std::mutex> lock(*config.gridMutex);
+		*config.partialGrid = grid;
+	}
+	if (config.onProgress) config.onProgress(total, total);
 
 	return grid;
 }
 
 void WFCGenerator::Propagate(std::vector<std::vector<uint32_t>>& possibilities,
-	uint32_t gridSize, uint32_t startX, uint32_t startY) {
+	uint32_t gridSize, uint32_t startX, uint32_t startY, CellHeap& heap) {
 
 	std::vector<std::pair<uint32_t, uint32_t>> stack;
 	stack.emplace_back(startX, startY);
@@ -112,8 +142,13 @@ void WFCGenerator::Propagate(std::vector<std::vector<uint32_t>>& possibilities,
 					}),
 				neighborPoss.end());
 
-			if (neighborPoss.size() < before && neighborPoss.size() == 1) {
-				stack.emplace_back(nx, ny);
+			if (neighborPoss.size() < before) {
+				// Neighbour's count shrank — push an updated heap entry so the
+				// main loop can pick it up (lazy deletion of the stale entry).
+				heap.push({ (uint32_t)neighborPoss.size(), ni });
+				if (neighborPoss.size() == 1) {
+					stack.emplace_back(nx, ny);
+				}
 			}
 		}
 	}

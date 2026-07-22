@@ -4,6 +4,7 @@
  * Benchmark mode: headless, runs warmup + recording frames, outputs CSV.
  */
 #include "GPUSceneManagement.h"
+#include "BenchmarkPanel.h"
 
 #ifdef USE_IMGUI
 #include "GuiWrapper.h"
@@ -68,6 +69,10 @@ int main(int argc, char* argv[]) {
 		else if (arg == "-recordframes")   { benchConfig.recordFrames = std::stoi(argv[++i]); }
 		else if (arg == "-output")         { benchConfig.outputPath    = argv[++i]; }
 		else if (arg == "-updatesize")     { benchConfig.updateSize    = std::stoi(argv[++i]); }
+		else if (arg == "-updatebatched")  { benchConfig.updateBatched = std::stoi(argv[++i]) != 0; }
+		else if (arg == "-cubeweight")     { benchConfig.cubeWeightOverride   = std::stof(argv[++i]); }
+		else if (arg == "-sphereweight")   { benchConfig.sphereWeightOverride = std::stof(argv[++i]); }
+		else if (arg == "-emptyweight")    { benchConfig.emptyWeightOverride  = std::stof(argv[++i]); }
 		else if (arg == "-w")              { winInit.width             = std::stoi(argv[++i]); }
 		else if (arg == "-h")              { winInit.height            = std::stoi(argv[++i]); }
 		else if (arg == "-lockcursor")     { lockCursor = true; }
@@ -77,6 +82,10 @@ int main(int argc, char* argv[]) {
 	if (benchmarkMode) {
 		winInit.width  = 256;
 		winInit.height = 256;
+		// Disable vsync in benchmark mode — FIFO throttles frames to display
+		// refresh (~5.5ms wait), masking true pipeline throughput. Mailbox
+		// presents without blocking on vertical sync.
+		vkInit.idealPresentMode = vk::PresentModeKHR::eMailbox;
 	}
 
 	Window* w = Window::CreateGameWindow(winInit);
@@ -85,17 +94,67 @@ int main(int argc, char* argv[]) {
 
 	GPUSceneManagement app(*w, vkInit);
 
+	// Hide cursor early — SetBenchmarkConfig may take minutes for WFC generation.
+	// The Alt-toggle state machine in RunFrame handles show/hide from frame 0 onward.
+	while (ShowCursor(FALSE) >= 0);  // force counter to -1
+
 #ifdef USE_IMGUI
 	GuiWrapper* gui = nullptr;
+	BenchmarkPanel benchPanel;
 	if (!benchmarkMode) {
 		gui = new GuiWrapper();
 		gui->Init(static_cast<Win32Code::Win32Window*>(w)->GetHandle(), app.GetRenderer());
 		app.SetGui(gui);
+		app.SetBenchPanel(&benchPanel);
 	}
 #endif
 
 	if (benchmarkMode) {
 		app.SetBenchmarkConfig(benchConfig);
+		app.SetBenchmarkEnabled(true);  // headless benchmark records unconditionally
+
+		// Local-update pilot: when -UpdateSize N is passed, measure the standalone
+		// cost of RegenerateChunks(N) over K repeats and exit — no render loop.
+		// Answers "is the update cost measurable above noise, and does it scale?"
+		if (benchConfig.updateSize > 0) {
+			const int kWarmup = 10, kRepeat = 100;
+			for (int i = 0; i < kWarmup; ++i) app.RunLocalUpdate(benchConfig.updateSize);
+
+			std::vector<double> samples;
+			samples.reserve(kRepeat);
+			for (int i = 0; i < kRepeat; ++i) {
+				app.RunLocalUpdate(benchConfig.updateSize);
+				samples.push_back(app.GetLastUpdateUs());
+			}
+
+			if (!benchConfig.outputPath.empty()) {
+				app.WriteUpdatePilotCSV(samples, benchConfig.updateSize, benchConfig.outputPath);
+			} else {
+				// No output path — print stats to stdout (manual/interactive probe).
+				std::sort(samples.begin(), samples.end());
+				double sum = 0.0;
+				for (double s : samples) sum += s;
+				double avg = sum / samples.size();
+				double var = 0.0;
+				for (double s : samples) var += (s - avg) * (s - avg);
+				double stddev = std::sqrt(var / samples.size());
+				double p99 = samples[(size_t)(samples.size() * 99 / 100)];
+
+				std::cout << "\n[Pilot] mode=" << (benchConfig.updateBatched ? "batched" : "perchunk")
+				          << " updateSize=" << benchConfig.updateSize
+				          << " scene=" << benchConfig.gridSize << "^2 chunk=" << benchConfig.chunkSize
+				          << " density=" << benchConfig.density << " seed=" << benchConfig.seed
+				          << " scheme=" << (int)benchConfig.scheme << "\n";
+				std::cout << "[Pilot] cost_us over " << kRepeat << " repeats: "
+				          << "avg=" << avg << " min=" << samples.front() << " max=" << samples.back()
+				          << " p99=" << p99 << " stddev=" << stddev << "\n";
+			}
+
+			app.Finish();
+			Window::DestroyGameWindow();
+			return 0;
+		}
+
 		int totalFrames = benchConfig.warmupFrames + benchConfig.recordFrames;
 		int frameIdx = 0;
 		while (w->UpdateWindow() && frameIdx < totalFrames && !app.IsBenchmarkComplete()) {
@@ -109,6 +168,7 @@ int main(int argc, char* argv[]) {
 			benchConfig.headless = false;
 			app.SetBenchmarkConfig(benchConfig);
 		}
+
 		while (w->UpdateWindow() && !Window::GetKeyboard()->KeyDown(KeyCodes::ESCAPE)) {
 			app.RunFrame(w->GetTimer().GetTimeDeltaSeconds());
 

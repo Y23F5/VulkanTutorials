@@ -4,16 +4,30 @@ file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS
     ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/*.h
 )
+# Exclude test files and standalone tools (each has its own main()) from main target
+list(FILTER SOURCES EXCLUDE REGEX ".*/Tests/.*")
+list(FILTER SOURCES EXCLUDE REGEX ".*/Tools/.*")
 
 add_executable(${TARGET_NAME} ${SOURCES})
 
 target_include_directories(${TARGET_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_BINARY_DIR}    # for generated GitVersion.h
     ${CMAKE_SOURCE_DIR}/NCLCoreClasses
     ${CMAKE_SOURCE_DIR}/VulkanRendering
     ${CMAKE_SOURCE_DIR}/GLTFLoader
     ${CMAKE_SOURCE_DIR}/VulkanTutorials
 )
+
+# Regenerate GitVersion.h before every build (captures commit + dirty state)
+add_custom_target(gitversion
+    COMMAND ${CMAKE_COMMAND}
+        -DSRCDIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -DDSTDIR=${CMAKE_CURRENT_BINARY_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/GenGitVersion.cmake
+    COMMENT "Capturing git commit for GitVersion.h"
+)
+add_dependencies(${TARGET_NAME} gitversion)
 
 target_compile_features(${TARGET_NAME} PRIVATE cxx_std_20)
 
@@ -23,16 +37,23 @@ target_compile_definitions(${TARGET_NAME} PRIVATE
     VULKAN_HPP_NO_STRUCT_CONSTRUCTORS
     VK_NO_PROTOTYPES
     ASSETROOTLOCATION="${CMAKE_SOURCE_DIR}/Assets/"
+    # $<CONFIG> resolves per-build (Debug/Release/...) on multi-config
+    # generators (VS), unlike CMAKE_BUILD_TYPE which is empty for those.
+    BUILD_CONFIG_NAME="$<CONFIG>"
 )
 
 # ImGui support (optional, for interactive debug mode)
 if(COMPILE_WITH_IMGUI)
     target_compile_definitions(${TARGET_NAME} PRIVATE USE_IMGUI=1)
-    target_include_directories(${TARGET_NAME} PRIVATE ${IMGUI_DIR} ${IMGUI_DIR}/backends)
+    target_include_directories(${TARGET_NAME} PRIVATE ${IMGUI_DIR} ${IMGUI_DIR}/backends ${CMAKE_SOURCE_DIR}/imgui)
     file(GLOB IMGUI_SOURCES ${IMGUI_DIR}/imgui*.cpp
         ${IMGUI_DIR}/backends/imgui_impl_vulkan.cpp
         ${IMGUI_DIR}/backends/imgui_impl_win32.cpp)
     target_sources(${TARGET_NAME} PRIVATE ${IMGUI_SOURCES})
+    target_sources(${TARGET_NAME} PRIVATE
+        ${CMAKE_SOURCE_DIR}/imgui/implot.cpp
+        ${CMAKE_SOURCE_DIR}/imgui/implot_items.cpp
+    )
 endif()
 
 # Shader compilation
@@ -64,5 +85,53 @@ target_link_libraries(${TARGET_NAME} PRIVATE
 )
 
 set_target_properties(${TARGET_NAME} PROPERTIES
+    VS_DEBUGGER_WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
+# ── Unit test target (no Vulkan dependency, WFC + data layout only) ──
+set(TEST_TARGET GPUDrivenRendering_Tests)
+add_executable(${TEST_TARGET}
+    Tests/TestMain.cpp
+    WFCGenerator.cpp
+)
+target_include_directories(${TEST_TARGET} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/NCLCoreClasses
+)
+target_compile_features(${TEST_TARGET} PRIVATE cxx_std_20)
+target_link_libraries(${TEST_TARGET} PRIVATE NCLCoreClasses)
+set_target_properties(${TEST_TARGET} PROPERTIES
+    VS_DEBUGGER_WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
+# ── Offline WFC histogram tool (no Vulkan, reproduces weight-sweep tile grids) ──
+set(HIST_TARGET WeightSweepHistogram)
+add_executable(${HIST_TARGET}
+    Tools/WeightSweepHistogram.cpp
+    WFCGenerator.cpp
+)
+target_include_directories(${HIST_TARGET} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/NCLCoreClasses
+)
+target_compile_features(${HIST_TARGET} PRIVATE cxx_std_20)
+target_link_libraries(${HIST_TARGET} PRIVATE NCLCoreClasses)
+set_target_properties(${HIST_TARGET} PROPERTIES
+    VS_DEBUGGER_WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
+# ── WFC probe (no Vulkan, tests whether emptyWeight breaks family-lock) ──
+set(PROBE_TARGET WFCProbe)
+add_executable(${PROBE_TARGET}
+    Tools/WFCProbe.cpp
+    WFCGenerator.cpp
+)
+target_include_directories(${PROBE_TARGET} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/NCLCoreClasses
+)
+target_compile_features(${PROBE_TARGET} PRIVATE cxx_std_20)
+target_link_libraries(${PROBE_TARGET} PRIVATE NCLCoreClasses)
+set_target_properties(${PROBE_TARGET} PROPERTIES
     VS_DEBUGGER_WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )

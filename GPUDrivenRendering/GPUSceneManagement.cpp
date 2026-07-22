@@ -6,29 +6,82 @@
  * Scheme 2: CPU frustum-culls chunks, fills indirect buffer, 2 indirect draws.
  * Scheme 3: Compute shader frustum-culls chunks, fills indirect buffer, 2 indirect draws.
  *
- * Measurement: QPC (CPU) + vkCmdWriteTimestamp2 (GPU), CSV output.
- * Two modes: interactive (window + optional ImGui monitor) and headless (-Benchmark).
+ * Measurement: QPC (CPU) + vkCmdWriteTimestamp2 (GPU), CSV output with per-metric stats.
+ * GPU timestamps collected per-frame via large query pool, read back in bulk at end.
+ * Two modes: interactive (window + optional ImGui + ChunkMonitor) and headless (-Benchmark).
  */
 #include "GPUSceneManagement.h"
+#include "FrustumCulling.h"
 #include "MshLoader.h"
 #include "VulkanComputePipelineBuilder.h"
 #include "VulkanDescriptorSetLayoutBuilder.h"
 #include "VulkanVMAMemoryManager.h"
 #include "WFCGenerator.h"
+#include "WFCCache.h"
+#include "GitVersion.h"
 
 #include "ChunkMonitor.h"
 #include "Win32Window.h"
 
+#include "BenchmarkPanel.h"
+
 using namespace NCL;
 using namespace Rendering;
 using namespace Vulkan;
+
+namespace {
+	// FNV-1a hash of the running executable's own bytes, for CSV provenance
+	// (distinguishes rebuilds sharing the same commit/dirty state, e.g. after
+	// an uncommitted edit). Same constants as Tests/TestMain.cpp's gridHash.
+	// Read failure (e.g. sandboxed/locked file) yields "unavailable" rather
+	// than a fabricated value.
+	std::string SelfExeHash() {
+		char path[MAX_PATH];
+		DWORD len = GetModuleFileNameA(nullptr, path, MAX_PATH);
+		if (len == 0 || len == MAX_PATH) return "unavailable";
+
+		std::ifstream file(path, std::ios::binary);
+		if (!file) return "unavailable";
+
+		uint64_t h = 1469598103934665603ULL;  // FNV-1a offset basis
+		char buf[65536];
+		while (file.read(buf, sizeof(buf)) || file.gcount() > 0) {
+			std::streamsize n = file.gcount();
+			for (std::streamsize i = 0; i < n; ++i) {
+				h ^= (unsigned char)buf[i];
+				h *= 1099511628211ULL;  // FNV-1a prime
+			}
+		}
+		char hex[17];
+		snprintf(hex, sizeof(hex), "%016llx", (unsigned long long)h);
+		return std::string(hex);
+	}
+
+	// NVIDIA packs driverVersion as major(10)/minor(8)/secondary(8)/tertiary(6)
+	// bits rather than the standard VK_VERSION_* macros; decode when the
+	// vendor ID matches (0x10DE), otherwise report the raw encoded value so
+	// the field is still honest for other vendors.
+	std::string DecodeDriverVersion(uint32_t vendorID, uint32_t driverVersion) {
+		char buf[64];
+		if (vendorID == 0x10DE) {
+			snprintf(buf, sizeof(buf), "%u.%u.%u.%u (raw=%u)",
+				(driverVersion >> 22) & 0x3ff, (driverVersion >> 14) & 0xff,
+				(driverVersion >> 6) & 0xff, driverVersion & 0x3f, driverVersion);
+		} else {
+			snprintf(buf, sizeof(buf), "%u.%u.%u (raw=%u)",
+				VK_VERSION_MAJOR(driverVersion), VK_VERSION_MINOR(driverVersion),
+				VK_VERSION_PATCH(driverVersion), driverVersion);
+		}
+		return std::string(buf);
+	}
+}
 
 GPUSceneManagement::GPUSceneManagement(Window& window, VulkanInitialisation& vkInit)
 	: m_hostWindow(window), m_controller(*window.GetKeyboard(), *window.GetMouse())
 	, m_vkInit(vkInit), m_totalInstances(0), m_gridChunks(0)
 	, m_cubeIndexCount(0), m_sphereIndexCount(0)
 	, m_isRecording(false), m_benchmarkComplete(false), m_currentFrame(0)
-	, m_monitor(nullptr), m_offscreenColour(nullptr), m_offscreenDepth(nullptr) {
+	, m_recordFrameIdx(0), m_drawCallCount(0) {
 
 	m_vkInit.autoBeginDynamicRendering = false;
 	Initialise();
@@ -37,12 +90,40 @@ GPUSceneManagement::GPUSceneManagement(Window& window, VulkanInitialisation& vkI
 
 GPUSceneManagement::~GPUSceneManagement() {
 	m_renderer->GetDevice().waitIdle();
-	m_memoryManager->DiscardBuffer(m_cameraBuffer, DiscardMode::Immediate);
+	// Discard ALL VMA-managed buffers before deleting the allocator.
+	// Members are destroyed after the destructor body; VMA would see
+	// live allocations and assert if we delete it first.
+	if (m_cameraBuffer.buffer)    m_memoryManager->DiscardBuffer(m_cameraBuffer,    DiscardMode::Immediate);
+	if (m_cullingBuffer.buffer)   m_memoryManager->DiscardBuffer(m_cullingBuffer,   DiscardMode::Immediate);
+	if (m_renderBuffer.buffer)    m_memoryManager->DiscardBuffer(m_renderBuffer,    DiscardMode::Immediate);
+	if (m_indirectBuffer.buffer)  m_memoryManager->DiscardBuffer(m_indirectBuffer,  DiscardMode::Immediate);
+	if (m_chunkBuffer.buffer)     m_memoryManager->DiscardBuffer(m_chunkBuffer,     DiscardMode::Immediate);
+	// Destroy meshes before deleting the memory manager — VulkanMesh::m_gpuBuffer
+	// holds a VMA allocation that ~VulkanBuffer frees via m_sourceManager.
+	m_cubeMesh.reset();
+	m_sphereMesh.reset();
 	delete m_memoryManager;
+
+	// Release all device-dependent Vulkan handles BEFORE destroying the
+	// device (delete m_renderer). These members would otherwise be destructed
+	// after the destructor body, when the device is already gone — a
+	// use-after-free that crashes on teardown (notably with the compute
+	// pipeline path in scheme 3).
+	m_graphicsPipeline.pipeline.reset();
+	m_graphicsPipeline.layout.reset();
+	m_computePipeline.pipeline.reset();
+	m_computePipeline.layout.reset();
+	m_sceneDescriptor.reset();
+	m_computeDescriptor.reset();
+	m_cameraDescriptor.reset();
+	m_sceneLayout.reset();
+	m_computeLayout.reset();
+	m_cameraLayout.reset();
+	m_defaultSampler.reset();
+	m_queryPool.reset();
+
 	delete m_renderer;
 	if (m_monitor) delete m_monitor;
-	if (m_offscreenColour) delete m_offscreenColour;
-	if (m_offscreenDepth) delete m_offscreenDepth;
 }
 
 void GPUSceneManagement::Finish() {
@@ -77,12 +158,9 @@ void GPUSceneManagement::Initialise() {
 	vk::PhysicalDeviceProperties props = m_renderer->GetPhysicalDevice().getProperties();
 	m_gpuTimestampPeriod = props.limits.timestampPeriod;
 
-	vk::QueryPoolCreateInfo qpCreate{};
-	qpCreate.queryType  = vk::QueryType::eTimestamp;
-	qpCreate.queryCount = 4;
-	m_queryPool = ctx.device.createQueryPoolUnique(qpCreate);
+	// Query pool created in CreateQueryPool() once config is known.
 
-	m_camera.SetFieldOfVision(45.0f).SetNearPlane(0.1f).SetFarPlane(2000.0f);
+	m_camera.SetFieldOfVision(45.0f).SetNearPlane(1.0f).SetFarPlane(100000.0f);
 	m_camera.SetPosition(Vector3(128, 120, -200));
 	m_camera.SetPitch(-35.0f).SetYaw(180.0f);
 	m_camera.SetController(m_controller);
@@ -130,45 +208,133 @@ void GPUSceneManagement::SetBenchmarkConfig(const BenchmarkConfig& config) {
 	          << " chunk=" << config.chunkSize << " density=" << config.density
 	          << " scheme=" << (int)config.scheme << " seed=" << config.seed << "\n";
 
-	GenerateScene();
+	// Try WFC cache first — same (grid, seed, density) reuses the generated
+	// scene instead of re-running WFC (minutes at 1024^2). On miss, generate
+	// and save so subsequent schemes / runs load instantly. Weight-override
+	// runs (cube/sphere weight sweep) bypass the cache entirely: density no
+	// longer determines the tile weights in that mode, so the (grid,seed,
+	// density) cache key would collide with the formal matrix's cached scenes.
+	bool usingWeightOverride = config.cubeWeightOverride >= 0.0f || config.sphereWeightOverride >= 0.0f
+		|| config.emptyWeightOverride >= 0.0f;
+	std::vector<uint32_t> cachedGrid;
+	uint32_t cachedSize = 0;
+	if (!usingWeightOverride && WFCCache::Load(cachedGrid, cachedSize, config.gridSize, config.seed, config.density)) {
+		m_tileGrid = std::move(cachedGrid);
+		GenerateScene(m_tileGrid);
+	} else {
+		GenerateScene();
+		if (!usingWeightOverride) WFCCache::Save(m_tileGrid, config.gridSize, config.seed, config.density);
+	}
 	CreateBuffers();
 	CreateDescriptorSets();
+	CreateQueryPool();
 
-	float sceneSize = m_benchConfig.gridSize * 2.0f;
-	m_camera.SetPosition(Vector3(sceneSize * 0.5f, sceneSize * 0.4f, -sceneSize * 0.7f));
-	m_camera.SetPitch(-35.0f).SetYaw(180.0f);
+	float sceneSize = m_benchConfig.gridSize * m_cellSize;
+	// Top-down overview: place camera above scene centre looking straight down,
+	// high enough that the full sceneSize x sceneSize grid fits in the 45deg FOV
+	// (h * tan(22.5) = sceneSize/2  ->  h ~= sceneSize * 1.2; use 1.4 for margin).
+	// This maximises visible instances so GPU load scales with total scene size,
+	// not just the fraction inside a narrow frustum.
+	float camY = sceneSize * 1.4f;
+	m_camera.SetPosition(Vector3(sceneSize * 0.5f, camY, sceneSize * 0.5f));
+	m_camera.SetPitch(-89.9f).SetYaw(180.0f);
+
+#ifdef USE_IMGUI
+	if (m_monitor) { delete m_monitor; m_monitor = nullptr; }
+#endif
+}
+
+/** Creates timestamp query pool sized for the recording frame count.
+ * 2 queries per frame (begin + end), read back in bulk at benchmark end.
+ */
+void GPUSceneManagement::CreateQueryPool() {
+	FrameContext const& ctx = m_renderer->GetFrameContext();
+	uint32_t count = 2 * (m_benchConfig.recordFrames + 1);
+	m_queryPool = ctx.device.createQueryPoolUnique(
+		vk::QueryPoolCreateInfo()
+			.setQueryType(vk::QueryType::eTimestamp)
+			.setQueryCount(count));
+}
+
+/** For scheme 3: reads the indirect buffer instanceCount fields to determine
+ *  per-chunk visibility after GPU compute culling completes.
+ *  Called after BeginFrame (fence wait ensures previous frame's GPU work is done).
+ *  Schemes 1 and 2 set m_chunkVisible directly during CPU culling — no-op here.
+ */
+void GPUSceneManagement::ReadbackGPUVisibility() {
+	if (m_benchConfig.scheme != RenderScheme::GPU_CullIndirect) return;
+	if (m_chunks.empty() || m_currentFrame == 0) return;
+
+	uint32_t* indirect = m_indirectBuffer.Map<uint32_t>();
+	for (uint32_t i = 0; i < m_chunks.size(); ++i) {
+		uint32_t cubeInst   = indirect[i * 10 + 1];   // cube instanceCount
+		uint32_t sphereInst = indirect[i * 10 + 6];   // sphere instanceCount
+		m_chunkVisible[i] = (cubeInst > 0 || sphereInst > 0);
+	}
+	m_indirectBuffer.Unmap();
 }
 
 void GPUSceneManagement::RunFrame(float dt) {
 	if (m_hostWindow.IsMinimised()) return;
 
-	bool altHeld = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+	// Benchmark mode must not consume real OS input state (Alt key, mouse
+	// look) — it corrupts the fixed top-down benchmark camera pose set in
+	// SetBenchmarkConfig() with incidental mouse movement during long runs.
+	bool altHeld = false;
+	if (!m_benchmarkEnabled) {
+		altHeld = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
 
-	// cursor + clip on state transition
-	if (altHeld != m_altWasHeld) {
-		m_altWasHeld = altHeld;
-		HWND hwnd = static_cast<Win32Code::Win32Window&>(m_hostWindow).GetHandle();
-		if (altHeld) {
-			ShowCursor(TRUE);
-			ClipCursor(nullptr);
-		} else {
-			ShowCursor(FALSE);
-			RECT r; GetClientRect(hwnd, &r);
-			POINT tl{ r.left, r.top }, br{ r.right, r.bottom };
-			ClientToScreen(hwnd, &tl);
-			ClientToScreen(hwnd, &br);
-			RECT cr{ tl.x, tl.y, br.x, br.y };
+		// ShowCursor uses an internal reference counter. Force it to exactly
+		// 0 (visible) or -1 (hidden) on each state transition.
+		if (altHeld != m_altWasHeld) {
+			m_altWasHeld = altHeld;
+			HWND hwnd = static_cast<Win32Code::Win32Window&>(m_hostWindow).GetHandle();
+			if (altHeld) {
+				while (ShowCursor(TRUE) < 0);
+				ClipCursor(nullptr);
+			} else {
+				while (ShowCursor(FALSE) >= 0);
+				RECT r; GetClientRect(hwnd, &r);
+				POINT tl{ r.left, r.top }, br{ r.right, r.bottom };
+				ClientToScreen(hwnd, &tl); ClientToScreen(hwnd, &br);
+				RECT cr{ tl.x, tl.y, br.x, br.y };
 				ClipCursor(&cr);
+			}
 		}
 	}
 
+#ifdef USE_IMGUI
+	// Frame-boundary scene rebuild. The panel only *requests* a rebuild (from
+	// its ImGui callback); the actual GPU work runs HERE, before BeginFrame(),
+	// while no command buffer is recording and the previous frame is already
+	// submitted+presented. Doing it inside the panel's Render() (mid-frame)
+	// frees buffers/descriptors the just-recorded draw commands still reference,
+	// causing VK_ERROR_DEVICE_LOST -> abort(). CreateBuffers() waitIdle()s, so
+	// the prior frame's GPU work is guaranteed complete before we discard.
+	if (m_benchPanel && m_benchPanel->HasPendingRebuild()) {
+		SetSceneParams(m_benchPanel->GetGenGridSize(), m_benchPanel->GetGenChunkSize(),
+			m_benchPanel->GetGenSeed(), m_benchPanel->GetGenDensity());
+		GenerateScene(m_benchPanel->GetRebuildGrid());
+		CreateBuffers();
+		CreateDescriptorSets();
+		CreateQueryPool();
+		m_benchPanel->RebuildConsumed();
+	}
+#endif
+
 	m_renderer->BeginFrame();
 
-	if (!altHeld)
+	ReadbackGPUVisibility();
+
+	if (!m_benchmarkEnabled && !altHeld)
 		m_camera.UpdateCamera(dt);
 
 	UploadCameraUniform();
 	m_memoryManager->Update();
+
+	if (m_renderPartial) {
+		UpdateSceneFromTileGrid(m_tileGrid);
+	}
 
 	switch (m_benchConfig.scheme) {
 		case RenderScheme::CPU_Instanced:    RenderScheme1(dt); break;
@@ -186,16 +352,35 @@ void GPUSceneManagement::RunFrame(float dt) {
 			ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NoMouse;
 		}
 		m_gui->StartNewFrame();
-		ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
-		ImGui::Begin("GPU-Driven Scene Management");
-		ImGui::Text("Scheme: %d  Frame: %u  Instances: %u  Chunks: %zu",
-			(int)m_benchConfig.scheme, m_currentFrame,
-			m_totalInstances, m_chunks.size());
-		ImGui::Separator();
-		ImGui::Text("Camera: %.1f, %.1f, %.1f  Pitch: %.1f  Yaw: %.1f",
-			m_camera.GetPosition().x, m_camera.GetPosition().y, m_camera.GetPosition().z,
-			m_camera.GetPitch(), m_camera.GetYaw());
-		ImGui::End();
+
+		// BenchmarkPanel
+		if (m_benchPanel) m_benchPanel->Render(this);
+		if (m_benchPanel && m_benchPanel->ShouldRenderPartial()) {
+			UpdateSceneFromTileGrid(m_benchPanel->GetPartialTileGrid());
+			SetRenderPartial(true);
+		}
+		if (m_benchPanel && m_benchPanel->GenerationReady() && m_benchPanel->GetState() == PanelState::Ready) {
+			SetRenderPartial(false);
+		}
+
+		// ChunkMonitor — recreate when scene dimensions change
+		if (m_gridChunks > 0) {
+			if (!m_monitor || m_monitorGridChunks != m_gridChunks) {
+				delete m_monitor;
+				m_monitor = new ChunkMonitor(m_gridChunks, m_benchConfig.chunkSize, m_benchConfig.gridSize);
+				m_monitorGridChunks = m_gridChunks;
+			}
+		}
+		if (m_monitor) {
+			std::vector<ChunkMonitorCell> cells(m_chunks.size());
+			for (size_t i = 0; i < m_chunks.size(); ++i) {
+				cells[i] = { m_chunks[i].instanceCount, m_chunkVisible[i] };
+			}
+			uint32_t dummyVis, dummyInst;
+			m_monitor->Update(cells.data(), dummyVis, dummyInst);
+			m_monitor->Render();
+		}
+
 		FrameContext const& ctx = m_renderer->GetFrameContext();
 		m_gui->Render(ctx.cmdBuffer);
 	}
@@ -204,8 +389,36 @@ void GPUSceneManagement::RunFrame(float dt) {
 	m_renderer->EndFrame();
 	m_renderer->SwapBuffers();
 
+	// Deferred query readback: last frame cmd buffer now submitted by EndFrame.
+	if (m_pendingReadback) {
+		m_pendingReadback = false;
+		Finish();
+		FrameContext const& rctx = m_renderer->GetFrameContext();
+		uint32_t numQueries = 2 * (uint32_t)m_frameStats.size();
+		std::vector<uint64_t> rawQueries(numQueries);
+		vk::Result r = rctx.device.getQueryPoolResults(*m_queryPool, 0, numQueries,
+			rawQueries.size() * sizeof(uint64_t), rawQueries.data(), sizeof(uint64_t),
+			vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
+		if (r == vk::Result::eSuccess) {
+			for (uint32_t i = 0; i < m_frameStats.size(); ++i) {
+				// GPU execution time from timestamp queries (independent of CPU record).
+				m_frameStats[i].gpuExecUs = (double)(rawQueries[2*i+1] - rawQueries[2*i])
+					* m_gpuTimestampPeriod / 1000.0;
+			}
+		}
+		WriteCSVSummary();
+		m_benchmarkComplete = true;
+	}
 	if (m_currentFrame == 0)
 		std::cout << "[GPUDriven] First frame rendered\n";
+
+	// benchmark progress: print every 100 frames during recording
+	if (m_isRecording && (m_recordFrameIdx % 100 == 0)) {
+		std::cout << "[Benchmark] frame " << m_currentFrame
+		          << " (recording " << m_recordFrameIdx << " of "
+		          << m_benchConfig.recordFrames << ")" << std::endl;
+	}
+
 	m_currentFrame++;
 }
 
@@ -222,18 +435,28 @@ void GPUSceneManagement::GenerateScene() {
 		case 50: wfcCfg.emptyWeight = 5.0f; wfcCfg.otherWeight = 5.0f; break;
 		case 80: wfcCfg.emptyWeight = 2.0f; wfcCfg.otherWeight = 10.0f; break;
 	}
+	wfcCfg.cubeWeight   = m_benchConfig.cubeWeightOverride;
+	wfcCfg.sphereWeight = m_benchConfig.sphereWeightOverride;
+	if (m_benchConfig.emptyWeightOverride >= 0.0f)
+		wfcCfg.emptyWeight = m_benchConfig.emptyWeightOverride;
 
 	m_tileGrid = gen.Generate(wfcCfg);
-	auto instances = gen.TileGridToInstances(m_tileGrid, wfcCfg.gridSize, 2.0f);
+	GenerateScene(m_tileGrid);
+}
+
+void GPUSceneManagement::GenerateScene(const std::vector<uint32_t>& tileGrid) {
+	std::cout << "[DEBUG GenScene] gridSize=" << m_benchConfig.gridSize << " chunkSize=" << m_benchConfig.chunkSize << " tileGrid.size=" << tileGrid.size() << std::endl;
+	WFCGenerator gen;
+	auto instances = gen.TileGridToInstances(tileGrid, m_benchConfig.gridSize, m_cellSize);
 
 	const uint32_t chunkDim = m_benchConfig.chunkSize;
-	m_gridChunks = wfcCfg.gridSize / chunkDim;
+	std::cout << "[DEBUG GenScene] instances=" << instances.size() << " m_gridChunks=" << m_gridChunks << std::endl;
+	m_gridChunks = m_benchConfig.gridSize / chunkDim;
 
 	std::vector<std::vector<WFCInstance>> buckets(m_gridChunks * m_gridChunks);
-	float cellSize = 2.0f;
 	for (const auto& inst : instances) {
-		uint32_t cx = std::min((uint32_t)(inst.posX / (chunkDim * cellSize)), m_gridChunks - 1);
-		uint32_t cy = std::min((uint32_t)(inst.posZ / (chunkDim * cellSize)), m_gridChunks - 1);
+		uint32_t cx = std::min((uint32_t)(inst.posX / (chunkDim * m_cellSize)), m_gridChunks - 1);
+		uint32_t cy = std::min((uint32_t)(inst.posZ / (chunkDim * m_cellSize)), m_gridChunks - 1);
 		buckets[cy * m_gridChunks + cx].push_back(inst);
 	}
 
@@ -280,6 +503,21 @@ void GPUSceneManagement::GenerateScene() {
 	          << "), scheme=" << (int)m_benchConfig.scheme << "\n";
 }
 
+void GPUSceneManagement::UpdateSceneFromTileGrid(const std::vector<uint32_t>& grid) {
+	WFCGenerator gen;
+	auto instances = gen.TileGridToInstances(grid, m_benchConfig.gridSize, m_cellSize);
+	m_cullingData.resize(instances.size());
+	m_renderData.resize(instances.size());
+	for (size_t i = 0; i < instances.size(); ++i) {
+		m_cullingData[i] = { instances[i].posX, instances[i].posY, instances[i].posZ,
+			instances[i].scaleX * 0.5f, instances[i].scaleY * 0.5f, instances[i].scaleZ * 0.5f };
+		m_renderData[i]  = { instances[i].r, instances[i].g, instances[i].b, 1.0f };
+	}
+	m_totalInstances = (uint32_t)instances.size();
+	WriteInstanceData();
+	ComputeChunkAABBs();
+}
+
 void GPUSceneManagement::ComputeChunkAABBs() {
 	for (auto& chunk : m_chunks) {
 		float minX = FLT_MAX, minY = FLT_MAX, minZ = FLT_MAX;
@@ -299,6 +537,15 @@ void GPUSceneManagement::ComputeChunkAABBs() {
 
 void GPUSceneManagement::CreateBuffers() {
 	FrameContext const& ctx = m_renderer->GetFrameContext();
+
+	// Discard previous allocations if this is a re-generation (e.g. panel
+	// [Generate] after the 16x16 startup scene). VulkanBuffer::operator=
+	// would otherwise leak the old VMA allocation, asserting on teardown.
+	m_renderer->GetDevice().waitIdle();
+	if (m_cullingBuffer.buffer)  m_memoryManager->DiscardBuffer(m_cullingBuffer,  DiscardMode::Immediate);
+	if (m_renderBuffer.buffer)   m_memoryManager->DiscardBuffer(m_renderBuffer,   DiscardMode::Immediate);
+	if (m_indirectBuffer.buffer) m_memoryManager->DiscardBuffer(m_indirectBuffer, DiscardMode::Immediate);
+	if (m_chunkBuffer.buffer)    m_memoryManager->DiscardBuffer(m_chunkBuffer,    DiscardMode::Immediate);
 
 	m_cullingBuffer = m_memoryManager->CreateBuffer(
 		{ .size = sizeof(CullingDatum) * m_totalInstances, .usage = vk::BufferUsageFlagBits::eStorageBuffer },
@@ -401,55 +648,36 @@ void GPUSceneManagement::CreateDescriptorSets() {
 
 void GPUSceneManagement::ExtractFrustumPlanes(Vector4 planes[6]) const {
 	Matrix4 vp = m_camera.BuildProjectionMatrix(m_hostWindow.GetScreenAspect()) * m_camera.BuildViewMatrix();
-	const auto& m = vp.array;
-
-	// Gribb-Hartmann: column-major matrix array[col][row]
-	// Left:   row3 + row0
-	planes[0] = Vector4(m[0][3] + m[0][0], m[1][3] + m[1][0], m[2][3] + m[2][0], m[3][3] + m[3][0]);
-	// Right:  row3 - row0
-	planes[1] = Vector4(m[0][3] - m[0][0], m[1][3] - m[1][0], m[2][3] - m[2][0], m[3][3] - m[3][0]);
-	// Bottom: row3 + row1
-	planes[2] = Vector4(m[0][3] + m[0][1], m[1][3] + m[1][1], m[2][3] + m[2][1], m[3][3] + m[3][1]);
-	// Top:    row3 - row1
-	planes[3] = Vector4(m[0][3] - m[0][1], m[1][3] - m[1][1], m[2][3] - m[2][1], m[3][3] - m[3][1]);
-	// Near:   row2
-	planes[4] = Vector4(m[0][2], m[1][2], m[2][2], m[3][2]);
-	// Far:    row3 - row2
-	planes[5] = Vector4(m[0][3] - m[0][2], m[1][3] - m[1][2], m[2][3] - m[2][2], m[3][3] - m[3][2]);
-
-	for (int i = 0; i < 6; ++i) {
-		float len = sqrt(planes[i].x * planes[i].x + planes[i].y * planes[i].y + planes[i].z * planes[i].z);
-		if (len > 0.0f) planes[i] = planes[i] / len;
-	}
+	NCL_ExtractFrustumPlanes(vp, planes);
 }
 
-static bool AABBInFrustum(const Vector4 planes[6], float minX, float minY, float minZ,
-                          float maxX, float maxY, float maxZ) {
-	for (int i = 0; i < 6; ++i) {
-		Vector3 p(planes[i].x > 0 ? maxX : minX,
-		          planes[i].y > 0 ? maxY : minY,
-		          planes[i].z > 0 ? maxZ : minZ);
-		if (Vector::Dot(Vector3(planes[i].x, planes[i].y, planes[i].z), p) + planes[i].w < 0)
-			return false;
-	}
-	return true;
-}
 
 void GPUSceneManagement::RenderScheme1(float dt) {
 	FrameContext const& ctx = m_renderer->GetFrameContext();
 	BeginMeasurement();
 
+	CpuSegBegin();  // segment 1: frustum cull (CPU work)
 	Vector4 frustumPlanes[6];
 	ExtractFrustumPlanes(frustumPlanes);
 
+	uint32_t drawCount = 0;
 	for (uint32_t i = 0; i < m_chunks.size(); ++i) {
 		const auto& chunk = m_chunks[i];
-		m_chunkVisible[i] = AABBInFrustum(frustumPlanes,
+		m_chunkVisible[i] = NCL_AABBInFrustum(frustumPlanes,
 			chunk.aabbMinX, chunk.aabbMinY, chunk.aabbMinZ,
 			chunk.aabbMaxX, chunk.aabbMaxY, chunk.aabbMaxZ);
 	}
+	CpuSegEnd();
 
+	// BeginRenderToScreen contains the swapchain acquire fence wait — measure
+	// it separately as present overhead, not pipeline CPU cost.
+	LARGE_INTEGER fw0, fw1;
+	QueryPerformanceCounter(&fw0);
 	m_renderer->BeginRenderToScreen(ctx.cmdBuffer);
+	QueryPerformanceCounter(&fw1);
+	MarkFenceWait((double)(fw1.QuadPart - fw0.QuadPart) * m_cpuTimestampPeriod / 1000.0);
+
+	CpuSegBegin();  // segment 2: pipeline bind + draw recording (CPU work)
 	ctx.cmdBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, m_graphicsPipeline);
 	ctx.cmdBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *m_graphicsPipeline.layout,
 		0, 1, &*m_sceneDescriptor, 0, nullptr);
@@ -461,15 +689,20 @@ void GPUSceneManagement::RenderScheme1(float dt) {
 		if (chunk.cubeCount > 0) {
 			m_cubeMesh->BindToCommandBuffer(ctx.cmdBuffer);
 			ctx.cmdBuffer.drawIndexed(m_cubeIndexCount, chunk.cubeCount, 0, 0, chunk.instanceOffset);
+			++drawCount;
 		}
 		if (chunk.sphereCount > 0) {
 			m_sphereMesh->BindToCommandBuffer(ctx.cmdBuffer);
 			ctx.cmdBuffer.drawIndexed(m_sphereIndexCount, chunk.sphereCount, 0, 0,
 				chunk.instanceOffset + chunk.cubeCount);
+			++drawCount;
 		}
 	}
+	m_drawCallCount = drawCount;
 
 	ctx.cmdBuffer.endRendering();
+	CpuSegEnd();
+
 	EndMeasurement();
 }
 
@@ -477,13 +710,14 @@ void GPUSceneManagement::RenderScheme2(float dt) {
 	FrameContext const& ctx = m_renderer->GetFrameContext();
 	BeginMeasurement();
 
+	CpuSegBegin();  // segment 1: cull + fill indirect buffer (CPU work)
 	Vector4 frustumPlanes[6];
 	ExtractFrustumPlanes(frustumPlanes);
 
 	uint32_t* indirectMap = m_indirectBuffer.Map<uint32_t>();
 	for (uint32_t i = 0; i < m_chunks.size(); ++i) {
 		const auto& chunk = m_chunks[i];
-		m_chunkVisible[i] = AABBInFrustum(frustumPlanes,
+		m_chunkVisible[i] = NCL_AABBInFrustum(frustumPlanes,
 			chunk.aabbMinX, chunk.aabbMinY, chunk.aabbMinZ,
 			chunk.aabbMaxX, chunk.aabbMaxY, chunk.aabbMaxZ);
 
@@ -508,8 +742,15 @@ void GPUSceneManagement::RenderScheme2(float dt) {
 	memBarrier.dstStageMask  = vk::PipelineStageFlagBits2::eDrawIndirect;
 	memBarrier.dstAccessMask = vk::AccessFlagBits2::eIndirectCommandRead;
 	ctx.cmdBuffer.pipelineBarrier2(vk::DependencyInfo().setMemoryBarriers(memBarrier));
+	CpuSegEnd();
 
+	LARGE_INTEGER fw0, fw1;
+	QueryPerformanceCounter(&fw0);
 	m_renderer->BeginRenderToScreen(ctx.cmdBuffer);
+	QueryPerformanceCounter(&fw1);
+	MarkFenceWait((double)(fw1.QuadPart - fw0.QuadPart) * m_cpuTimestampPeriod / 1000.0);
+
+	CpuSegBegin();  // segment 2: indirect draw recording (CPU work)
 	ctx.cmdBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, m_graphicsPipeline);
 	ctx.cmdBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *m_graphicsPipeline.layout,
 		0, 1, &*m_sceneDescriptor, 0, nullptr);
@@ -523,7 +764,10 @@ void GPUSceneManagement::RenderScheme2(float dt) {
 	m_sphereMesh->BindToCommandBuffer(ctx.cmdBuffer);
 	ctx.cmdBuffer.drawIndexedIndirect(m_indirectBuffer.buffer, 5 * sizeof(uint32_t), drawCount, stride);
 
+	m_drawCallCount = 2;
+
 	ctx.cmdBuffer.endRendering();
+	CpuSegEnd();
 	EndMeasurement();
 }
 
@@ -531,6 +775,7 @@ void GPUSceneManagement::RenderScheme3(float dt) {
 	FrameContext const& ctx = m_renderer->GetFrameContext();
 	BeginMeasurement();
 
+	CpuSegBegin();  // segment 1: fillBuffer + compute dispatch recording (CPU work)
 	uint32_t indirectSize = (uint32_t)m_chunks.size() * 2 * 5 * sizeof(uint32_t);
 	ctx.cmdBuffer.fillBuffer(m_indirectBuffer.buffer, 0, indirectSize, 0);
 
@@ -567,8 +812,15 @@ void GPUSceneManagement::RenderScheme3(float dt) {
 	computeBarrier.buffer = m_indirectBuffer.buffer;
 	computeBarrier.size   = indirectSize;
 	ctx.cmdBuffer.pipelineBarrier2(vk::DependencyInfo().setBufferMemoryBarriers(computeBarrier));
+	CpuSegEnd();
 
+	LARGE_INTEGER fw0, fw1;
+	QueryPerformanceCounter(&fw0);
 	m_renderer->BeginRenderToScreen(ctx.cmdBuffer);
+	QueryPerformanceCounter(&fw1);
+	MarkFenceWait((double)(fw1.QuadPart - fw0.QuadPart) * m_cpuTimestampPeriod / 1000.0);
+
+	CpuSegBegin();  // segment 2: indirect draw recording (CPU work)
 	ctx.cmdBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, m_graphicsPipeline);
 	ctx.cmdBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *m_graphicsPipeline.layout,
 		0, 1, &*m_sceneDescriptor, 0, nullptr);
@@ -582,21 +834,49 @@ void GPUSceneManagement::RenderScheme3(float dt) {
 	m_sphereMesh->BindToCommandBuffer(ctx.cmdBuffer);
 	ctx.cmdBuffer.drawIndexedIndirect(m_indirectBuffer.buffer, 5 * sizeof(uint32_t), drawCount3, stride3);
 
+	m_drawCallCount = 2;
+
 	ctx.cmdBuffer.endRendering();
+	CpuSegEnd();
 	EndMeasurement();
 }
 
 void GPUSceneManagement::BeginMeasurement() {
-	if (!m_isRecording && m_currentFrame >= m_benchConfig.warmupFrames) {
+	if (!m_isRecording && m_benchmarkEnabled && !m_benchmarkComplete && m_currentFrame >= m_benchConfig.warmupFrames) {
 		m_isRecording = true;
+		m_recordFrameIdx = 0;
 	}
 	if (!m_isRecording) return;
 
 	QueryPerformanceCounter(&m_frameStartQpc);
+	m_cpuRecordAccumUs = 0.0;   // reset per-frame CPU recording accumulator
+	m_cpuWaitUs = 0.0;
 
 	FrameContext const& ctx = m_renderer->GetFrameContext();
-	ctx.cmdBuffer.resetQueryPool(*m_queryPool, 0, 2);
-	ctx.cmdBuffer.writeTimestamp2(vk::PipelineStageFlagBits2::eTopOfPipe, *m_queryPool, 0);
+	uint32_t qBase = 2 * m_recordFrameIdx;
+	ctx.cmdBuffer.resetQueryPool(*m_queryPool, qBase, 2);
+	ctx.cmdBuffer.writeTimestamp2(vk::PipelineStageFlagBits2::eTopOfPipe, *m_queryPool, qBase);
+}
+
+// Begin a CPU recording segment (excludes fence wait between segments).
+void GPUSceneManagement::CpuSegBegin() {
+	if (!m_isRecording) return;
+	QueryPerformanceCounter(&m_segStartQpc);
+}
+
+// End a CPU recording segment, accumulating its duration.
+void GPUSceneManagement::CpuSegEnd() {
+	if (!m_isRecording) return;
+	LARGE_INTEGER now;
+	QueryPerformanceCounter(&now);
+	m_cpuRecordAccumUs += (double)(now.QuadPart - m_segStartQpc.QuadPart)
+	                     * m_cpuTimestampPeriod / 1000.0;
+}
+
+// Record the fence-wait duration (swapchain acquire), reported separately.
+void GPUSceneManagement::MarkFenceWait(double waitUs) {
+	if (!m_isRecording) return;
+	m_cpuWaitUs += waitUs;
 }
 
 void GPUSceneManagement::EndMeasurement() {
@@ -606,60 +886,284 @@ void GPUSceneManagement::EndMeasurement() {
 	QueryPerformanceCounter(&endQpc);
 
 	FrameContext const& ctx = m_renderer->GetFrameContext();
-	ctx.cmdBuffer.writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe, *m_queryPool, 1);
-
-	FrameStats stats = {};
-	stats.totalTimeUs = (double)(endQpc.QuadPart - m_frameStartQpc.QuadPart)
-	                   * m_cpuTimestampPeriod / 1000.0;
-	stats.drawCalls   = 2;
+	uint32_t qBase = 2 * m_recordFrameIdx;
+	ctx.cmdBuffer.writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe, *m_queryPool, qBase + 1);
 
 	uint32_t visCount = 0;
-	for (bool v : m_chunkVisible) if (v) visCount++;
-	stats.visibleInstances = visCount;
+	for (bool v : m_chunkVisible) if (v) ++visCount;
+
+	FrameStats stats = {};
+	stats.frameWallUs = (double)(endQpc.QuadPart - m_frameStartQpc.QuadPart)
+	                   * m_cpuTimestampPeriod / 1000.0;
+	stats.cpuRecordUs = m_cpuRecordAccumUs;   // cull + submit, excludes fence wait
+	stats.cpuWaitUs   = m_cpuWaitUs;          // swapchain acquire fence wait
+	stats.drawCalls   = m_drawCallCount;
+	stats.visibleChunks = visCount;
+	stats.gpuExecUs = 0;  // filled in deferred readback after bulk query read
 
 	m_frameStats.push_back(stats);
+	++m_recordFrameIdx;
 
-	if (m_frameStats.size() >= m_benchConfig.recordFrames) {
-		Finish();
-		auto result = ctx.device.getQueryPoolResults<uint64_t>(*m_queryPool, 0, 2,
-			2 * sizeof(uint64_t), sizeof(uint64_t),
-			vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
-		uint64_t gpuNs = (result.value[1] - result.value[0]) * m_gpuTimestampPeriod;
-		m_frameStats.back().gpuTimeUs = gpuNs / 1000.0;
+		if (m_frameStats.size() >= m_benchConfig.recordFrames) {
+			m_isRecording = false;
+			m_pendingReadback = true;
+		}
+}
 
-		WriteCSVSummary();
-		m_isRecording = false;
-		m_benchmarkComplete = true;
-	}
+static void computeStats(const std::vector<double>& values, double& avg, double& minVal,
+                         double& maxVal, double& p1, double& p99, double& stddev) {
+	if (values.empty()) { avg = minVal = maxVal = p1 = p99 = stddev = 0; return; }
+	avg = std::accumulate(values.begin(), values.end(), 0.0) / values.size();
+	auto [minIt, maxIt] = std::minmax_element(values.begin(), values.end());
+	minVal = *minIt;
+	maxVal = *maxIt;
+	std::vector<double> sorted = values;
+	std::sort(sorted.begin(), sorted.end());
+	size_t n = sorted.size();
+	p1  = sorted[std::max(size_t(1), n / 100) - 1];
+	p99 = sorted[std::min(n, n * 99 / 100) - 1];
+	stddev = 0.0;
+	for (double v : values) stddev += (v - avg) * (v - avg);
+	stddev = sqrt(stddev / n);
 }
 
 void GPUSceneManagement::WriteCSVSummary() {
 	if (m_benchConfig.outputPath.empty()) return;
 
-	std::ofstream file(m_benchConfig.outputPath);
-	file << "frame,cpu_us,gpu_us,total_us,draw_calls,visible_instances\n";
+	// Ensure parent directory exists — ofstream will not create it.
+	std::filesystem::path outPath(m_benchConfig.outputPath);
+	if (outPath.has_parent_path())
+		std::filesystem::create_directories(outPath.parent_path());
 
-	std::vector<double> totalTimes;
-	for (uint32_t i = 0; i < m_frameStats.size(); ++i) {
-		const auto& s = m_frameStats[i];
-		file << i << "," << s.cpuTimeUs << "," << s.gpuTimeUs << ","
-		     << s.totalTimeUs << "," << s.drawCalls << "," << s.visibleInstances << "\n";
-		totalTimes.push_back(s.totalTimeUs);
+	std::ofstream file(m_benchConfig.outputPath);
+	if (!file) {
+		std::cerr << "[Benchmark] Failed to open " << m_benchConfig.outputPath << " for writing\n";
+		return;
 	}
 
-	std::sort(totalTimes.begin(), totalTimes.end());
-	double avg = std::accumulate(totalTimes.begin(), totalTimes.end(), 0.0) / totalTimes.size();
-	double min = totalTimes.front(), max = totalTimes.back();
-	double p1  = totalTimes[totalTimes.size() / 100];
-	double p99 = totalTimes[totalTimes.size() * 99 / 100];
-	double stddev = 0.0;
-	for (double t : totalTimes) stddev += (t - avg) * (t - avg);
-	stddev = sqrt(stddev / totalTimes.size());
+	// Reproducibility metadata — parsers must skip lines starting with '#'.
+	vk::PhysicalDeviceProperties props = m_renderer->GetPhysicalDevice().getProperties();
+	file << "# commit=" << GIT_COMMIT << "\n";
+	file << "# dirty=" << (GIT_DIRTY ? "true" : "false") << "\n";
+	file << "# build_config=" << BUILD_CONFIG_NAME << "\n";
+	file << "# exe_hash=" << SelfExeHash() << "\n";
+	file << "# gpu=" << props.deviceName.data() << "\n";
+	file << "# driver_version=" << DecodeDriverVersion(props.vendorID, props.driverVersion) << "\n";
+	file << "# grid=" << m_benchConfig.gridSize << " chunk=" << m_benchConfig.chunkSize
+	     << " density=" << m_benchConfig.density << " scheme=" << (int)m_benchConfig.scheme
+	     << " seed=" << m_benchConfig.seed << "\n";
+	// Weight overrides: -1 means unset (density-derived weights used, formal matrix).
+	// Any value >=0 means the percolation/ratio sweep bypassed the density switch.
+	file << "# cube_weight_override=" << m_benchConfig.cubeWeightOverride
+	     << " sphere_weight_override=" << m_benchConfig.sphereWeightOverride
+	     << " empty_weight_override=" << m_benchConfig.emptyWeightOverride << "\n";
+	file << "# warmup=" << m_benchConfig.warmupFrames << " record=" << m_benchConfig.recordFrames << "\n";
+	file << "# present_mode=mailbox\n";
+	file << "frame,cpu_record_us,cpu_wait_us,gpu_exec_us,frame_wall_us,draw_calls,visible_chunks\n";
 
-	file << "AVG," << avg << "\nMIN," << min << "\nMAX," << max
-	     << "\nP1," << p1 << "\nP99," << p99 << "\nSTDDEV," << stddev << "\n";
+	std::vector<double> cpuRecord, cpuWait, gpuExec, frameWall;
+	for (uint32_t i = 0; i < m_frameStats.size(); ++i) {
+		const auto& s = m_frameStats[i];
+		file << i << "," << s.cpuRecordUs << "," << s.cpuWaitUs << "," << s.gpuExecUs << ","
+		     << s.frameWallUs << "," << s.drawCalls << "," << s.visibleChunks << "\n";
+		cpuRecord.push_back(s.cpuRecordUs);
+		cpuWait.push_back(s.cpuWaitUs);
+		gpuExec.push_back(s.gpuExecUs);
+		frameWall.push_back(s.frameWallUs);
+	}
+
+	auto writeRow = [&](const char* label, const std::vector<double>& vals) {
+		double a, mn, mx, p1, p99, sd;
+		computeStats(vals, a, mn, mx, p1, p99, sd);
+		file << label << "," << a << "," << mn << "," << mx << "," << p1 << "," << p99 << "," << sd << "\n";
+	};
+
+	file << "\ncpu_record_us_summary,avg,min,max,p1,p99,stddev\n";
+	writeRow("cpu_record", cpuRecord);
+	file << "\ncpu_wait_us_summary,avg,min,max,p1,p99,stddev\n";
+	writeRow("cpu_wait", cpuWait);
+	file << "\ngpu_exec_us_summary,avg,min,max,p1,p99,stddev\n";
+	writeRow("gpu_exec", gpuExec);
+	file << "\nframe_wall_us_summary,avg,min,max,p1,p99,stddev\n";
+	writeRow("frame_wall", frameWall);
+
+	std::cout << "[Benchmark] CSV written: " << m_benchConfig.outputPath
+	          << " (" << m_frameStats.size() << " frames)\n";
 }
 
-void GPUSceneManagement::CreateOffscreenResources() {}
-void GPUSceneManagement::BeginOffscreenRender(vk::CommandBuffer) {}
+/** Writes the standalone local-update pilot samples to CSV: per-repeat cost plus
+ *  a summary row. Same metadata-header convention as WriteCSVSummary so the Python
+ *  aggregator parses both formats uniformly (lines starting with '#' are skipped).
+ */
+void GPUSceneManagement::WriteUpdatePilotCSV(const std::vector<double>& samples,
+                                             uint32_t updateSize, const std::string& path) {
+	std::filesystem::path outPath(path);
+	if (outPath.has_parent_path())
+		std::filesystem::create_directories(outPath.parent_path());
 
+	std::ofstream file(path);
+	if (!file) {
+		std::cerr << "[Pilot] Failed to open " << path << " for writing\n";
+		return;
+	}
+
+	vk::PhysicalDeviceProperties props = m_renderer->GetPhysicalDevice().getProperties();
+	file << "# commit=" << GIT_COMMIT << "\n";
+	file << "# dirty=" << (GIT_DIRTY ? "true" : "false") << "\n";
+	file << "# build_config=" << BUILD_CONFIG_NAME << "\n";
+	file << "# exe_hash=" << SelfExeHash() << "\n";
+	file << "# gpu=" << props.deviceName.data() << "\n";
+	file << "# driver_version=" << DecodeDriverVersion(props.vendorID, props.driverVersion) << "\n";
+	file << "# grid=" << m_benchConfig.gridSize << " chunk=" << m_benchConfig.chunkSize
+	     << " density=" << m_benchConfig.density << " scheme=" << (int)m_benchConfig.scheme
+	     << " seed=" << m_benchConfig.seed << "\n";
+	file << "# mode=" << (m_benchConfig.updateBatched ? "batched" : "perchunk")
+	     << " updateSize=" << updateSize << " repeats=" << samples.size() << "\n";
+
+	file << "repeat,cost_us\n";
+	for (size_t i = 0; i < samples.size(); ++i)
+		file << i << "," << samples[i] << "\n";
+
+	double a, mn, mx, p1, p99, sd;
+	computeStats(samples, a, mn, mx, p1, p99, sd);
+	file << "\nupdate_cost_us_summary,avg,min,max,p1,p99,stddev\n";
+	file << "update_cost," << a << "," << mn << "," << mx << "," << p1 << "," << p99 << "," << sd << "\n";
+
+	std::cout << "[Pilot] CSV written: " << path << " (" << samples.size() << " repeats)\n";
+}
+
+/** Regenerates instance data for a subset of chunks, simulating local scene edits.
+ *  updateCount random non-empty chunks are selected and their instances randomized
+ *  (new scaleY, new color). Only the affected SSBO regions are re-uploaded.
+ *  Timing is measured via warmup+record epochs identical to the main benchmark.
+ */
+void GPUSceneManagement::RegenerateChunks(uint32_t updateCount) {
+	if (updateCount == 0 || m_chunks.empty()) return;
+
+	std::cout << "[Update] Regenerating " << updateCount << " chunk(s)...\n";
+
+	// Select random non-empty chunks
+	std::vector<uint32_t> candidates;
+	for (uint32_t i = 0; i < m_chunks.size(); ++i)
+		if (m_chunks[i].instanceCount > 0) candidates.push_back(i);
+
+	std::mt19937 rng(m_benchConfig.seed + 9999);
+	std::shuffle(candidates.begin(), candidates.end(), rng);
+	updateCount = std::min(updateCount, (uint32_t)candidates.size());
+	candidates.resize(updateCount);
+
+	// Regenerate instance data for selected chunks
+	std::uniform_real_distribution<float> scaleDist(0.0f, 1.0f);
+	for (uint32_t ci : candidates) {
+		auto& chunk = m_chunks[ci];
+		for (uint32_t j = 0; j < chunk.instanceCount; ++j) {
+			uint32_t idx = chunk.instanceOffset + j;
+			// Randomize scaleY within plausible bounds
+			float newScaleY = 1.0f + scaleDist(rng) * 10.0f;
+			m_cullingData[idx].halfY = newScaleY * 0.5f;
+			m_cullingData[idx].centerY = newScaleY * 0.5f;
+			// Randomize color slightly
+			m_renderData[idx].r = 0.3f + scaleDist(rng) * 0.7f;
+			m_renderData[idx].g = 0.3f + scaleDist(rng) * 0.7f;
+			m_renderData[idx].b = 0.3f + scaleDist(rng) * 0.7f;
+		}
+	}
+
+	// Re-upload affected SSBO regions via staging. Time only this transfer
+	// work (staging alloc + memcpy + copyBuffer + submit/wait) — this is the
+	// "buffer update cost" the pilot probes. Two modes isolate the effect of
+	// submission batching (the only variable that differs between them):
+	//   perchunk — one submit + fence wait per chunk (naive counterfactual)
+	//   batched  — all copies in one command buffer, a single submit + wait
+	// Copy regions stay one-per-chunk in both (SSBO regions are non-contiguous
+	// and cannot be merged); only the submit count changes (N vs 1).
+	LARGE_INTEGER updBegin;
+	QueryPerformanceCounter(&updBegin);
+	uint64_t updBytes = 0;
+
+	FrameContext const& ctx = m_renderer->GetFrameContext();
+
+	if (m_benchConfig.updateBatched) {
+		std::vector<VulkanBuffer> staging;
+		staging.reserve(candidates.size() * 2);
+		vk::UniqueCommandBuffer cmd = CmdBufferCreateBegin(ctx.device, ctx.commandPools[CommandType::Graphics], "UpdateBatched");
+		for (uint32_t ci : candidates) {
+			const auto& chunk = m_chunks[ci];
+			uint32_t offset = chunk.instanceOffset;
+			uint32_t count  = chunk.instanceCount;
+			updBytes += (uint64_t)count * (sizeof(CullingDatum) + sizeof(RenderDatum));
+
+			auto stgCull = m_memoryManager->CreateBuffer(
+				{ .size = sizeof(CullingDatum) * count, .usage = vk::BufferUsageFlagBits::eTransferSrc },
+				vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent, "StgCullUpd");
+			memcpy(stgCull.Map<CullingDatum>(), &m_cullingData[offset], sizeof(CullingDatum) * count);
+			stgCull.Unmap();
+
+			auto stgRender = m_memoryManager->CreateBuffer(
+				{ .size = sizeof(RenderDatum) * count, .usage = vk::BufferUsageFlagBits::eTransferSrc },
+				vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent, "StgRenderUpd");
+			memcpy(stgRender.Map<RenderDatum>(), &m_renderData[offset], sizeof(RenderDatum) * count);
+			stgRender.Unmap();
+
+			vk::BufferCopy cpCull{0, offset * sizeof(CullingDatum), sizeof(CullingDatum) * count};
+			cmd->copyBuffer(stgCull.buffer, m_cullingBuffer.buffer, 1, &cpCull);
+			vk::BufferCopy cpRender{0, offset * sizeof(RenderDatum), sizeof(RenderDatum) * count};
+			cmd->copyBuffer(stgRender.buffer, m_renderBuffer.buffer, 1, &cpRender);
+
+			// Staging buffers must outlive the single submit — discard after the wait.
+			staging.push_back(std::move(stgCull));
+			staging.push_back(std::move(stgRender));
+		}
+		CmdBufferEndSubmitWait(*cmd, ctx.device, ctx.queues[CommandType::Graphics]);
+		for (auto& s : staging) m_memoryManager->DiscardBuffer(s, DiscardMode::Immediate);
+	} else {
+		for (uint32_t ci : candidates) {
+			const auto& chunk = m_chunks[ci];
+			uint32_t offset = chunk.instanceOffset;
+			uint32_t count  = chunk.instanceCount;
+			updBytes += (uint64_t)count * (sizeof(CullingDatum) + sizeof(RenderDatum));
+
+			auto stgCull = m_memoryManager->CreateBuffer(
+				{ .size = sizeof(CullingDatum) * count, .usage = vk::BufferUsageFlagBits::eTransferSrc },
+				vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent, "StgCullUpd");
+			memcpy(stgCull.Map<CullingDatum>(), &m_cullingData[offset], sizeof(CullingDatum) * count);
+			stgCull.Unmap();
+
+			auto stgRender = m_memoryManager->CreateBuffer(
+				{ .size = sizeof(RenderDatum) * count, .usage = vk::BufferUsageFlagBits::eTransferSrc },
+				vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent, "StgRenderUpd");
+			memcpy(stgRender.Map<RenderDatum>(), &m_renderData[offset], sizeof(RenderDatum) * count);
+			stgRender.Unmap();
+
+			vk::UniqueCommandBuffer cmd = CmdBufferCreateBegin(ctx.device, ctx.commandPools[CommandType::Graphics], "Update");
+			vk::BufferCopy cpCull{0, offset * sizeof(CullingDatum), sizeof(CullingDatum) * count};
+			cmd->copyBuffer(stgCull.buffer, m_cullingBuffer.buffer, 1, &cpCull);
+			vk::BufferCopy cpRender{0, offset * sizeof(RenderDatum), sizeof(RenderDatum) * count};
+			cmd->copyBuffer(stgRender.buffer, m_renderBuffer.buffer, 1, &cpRender);
+			CmdBufferEndSubmitWait(*cmd, ctx.device, ctx.queues[CommandType::Graphics]);
+
+			m_memoryManager->DiscardBuffer(stgCull, DiscardMode::Immediate);
+			m_memoryManager->DiscardBuffer(stgRender, DiscardMode::Immediate);
+		}
+	}
+
+	// Force indirect buffer refill for schemes 2 (next frame CPU fill will pick up changes)
+	// Scheme 3 GPU compute reads the new SSBO automatically.
+
+	LARGE_INTEGER updEnd;
+	QueryPerformanceCounter(&updEnd);
+	m_lastUpdateUs = (double)(updEnd.QuadPart - updBegin.QuadPart)
+	               * m_cpuTimestampPeriod / 1000.0;
+
+	uint32_t totalAffected = 0;
+	for (uint32_t ci : candidates) totalAffected += m_chunks[ci].instanceCount;
+	std::cout << "[Update] mode=" << (m_benchConfig.updateBatched ? "batched" : "perchunk")
+	          << " size=" << updateCount << " chunks=" << candidates.size()
+	          << " instances=" << totalAffected << " bytes=" << updBytes
+	          << " cost=" << m_lastUpdateUs << " us\n";
+}
+
+/** Offscreen rendering stubs — not yet implemented.
+ *  Headless benchmark currently uses a tiny window + swapchain.
+ *  True headless with VK_KHR_display / offscreen-render-to-image is future work.
+ */

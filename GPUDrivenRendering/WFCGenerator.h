@@ -7,6 +7,10 @@
 #include <vector>
 #include <cstdint>
 #include <random>
+#include <functional>
+#include <mutex>
+#include <queue>
+#include <utility>
 
 namespace NCL::Rendering::Vulkan {
 
@@ -26,11 +30,22 @@ struct WFCInstance {
 	bool isCube;
 };
 
+using WFCProgressCallback = std::function<void(uint32_t collapsed, uint32_t total)>;
+
 struct WFCConfig {
-	uint32_t gridSize  = 128;
-	uint32_t seed      = 42;
-	float emptyWeight  = 5.0f;
-	float otherWeight  = 5.0f;
+	uint32_t gridSize        = 128;
+	uint32_t seed            = 42;
+	float emptyWeight        = 5.0f;
+	float otherWeight        = 5.0f;
+	// Optional per-family overrides for the 5 non-empty tiles, split from
+	// otherWeight's single value. Negative (default) means "use otherWeight
+	// for this family" — existing configs that only set otherWeight are
+	// unaffected byte-for-byte. Only meaningful when >= 0.
+	float cubeWeight         = -1.0f;
+	float sphereWeight       = -1.0f;
+	WFCProgressCallback onProgress;
+	std::vector<uint32_t>* partialGrid = nullptr;
+	std::mutex* gridMutex = nullptr;
 };
 
 class WFCGenerator {
@@ -49,8 +64,14 @@ public:
 	static constexpr uint32_t kEmptyTile = 0;
 
 private:
+	// Min-heap entry: (possibility count, cell index). std::greater orders
+	// smallest count first, ties broken by smallest index — exactly matching
+	// the original linear-scan tie-break, preserving collapse order & seeds.
+	using HeapEntry = std::pair<uint32_t, uint32_t>;
+	using CellHeap = std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<HeapEntry>>;
+
 	void Propagate(std::vector<std::vector<uint32_t>>& possibilities,
-		uint32_t gridSize, uint32_t changedX, uint32_t changedY);
+		uint32_t gridSize, uint32_t changedX, uint32_t changedY, CellHeap& heap);
 	bool IsValidAdjacency(uint32_t tileA, uint32_t tileB) const;
 
 	mutable std::mt19937 m_rng;

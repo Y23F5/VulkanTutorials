@@ -7,6 +7,7 @@
 #include <vector>
 #include <cstdint>
 #include <fstream>
+#include <filesystem>
 #include <algorithm>
 #include <numeric>
 #include <cmath>
@@ -37,6 +38,8 @@
 #include "VulkanPipelineBuilder.h"
 #include "VulkanUtils.h"
 #include "VulkanMemoryManager.h"
+
+class BenchmarkPanel;
 
 #ifdef USE_IMGUI
 #include "GuiWrapper.h"
@@ -75,24 +78,38 @@ struct ChunkInfo {
 static_assert(sizeof(ChunkInfo) == 48);
 
 struct FrameStats {
-	double cpuTimeUs;
-	double gpuTimeUs;
-	double totalTimeUs;
+	double cpuRecordUs;    // CPU command recording (cull + submit), excludes fence wait
+	double cpuWaitUs;      // CPU wait on swapchain acquire fence (present overhead)
+	double gpuExecUs;      // GPU execution time (timestamp query)
+	double frameWallUs;    // end-to-end wall-clock (record + wait), contains present noise
 	uint32_t drawCalls;
-	uint32_t visibleInstances;
+	uint32_t visibleChunks;
 };
 
 struct BenchmarkConfig {
-	uint32_t gridSize     = 128;
-	uint32_t chunkSize    = 8;
+	uint32_t gridSize     = 16;
+	uint32_t chunkSize    = 16;
 	uint32_t density      = 50;
 	RenderScheme scheme   = RenderScheme::GPU_CullIndirect;
 	uint32_t seed         = 42;
 	uint32_t warmupFrames = 120;
 	uint32_t recordFrames = 1200;
 	uint32_t updateSize   = 0;
+	bool updateBatched    = true;   // batch all region copies into one submit
 	std::string outputPath;
 	bool headless         = false;
+	// Supplementary-experiment override: split the density-derived otherWeight
+	// into independent cube/sphere weights. Unset (<0, default) means the
+	// normal density switch in GenerateScene() applies, byte-identical to the
+	// formal 810-config matrix. When set, bypasses the WFC disk cache (this
+	// path is for the small weight-ratio sweep, not the cached formal matrix).
+	float cubeWeightOverride   = -1.0f;
+	float sphereWeightOverride = -1.0f;
+	// Empty-weight override for the percolation sweep: raising emptyWeight above
+	// the density-derived value breaks the cube/sphere family-lock (the two
+	// families can only neighbour via EMPTY), enabling continuous mixed
+	// compositions. Unset (<0) keeps the density-derived emptyWeight.
+	float emptyWeightOverride  = -1.0f;
 };
 
 class GPUSceneManagement {
@@ -107,10 +124,54 @@ public:
 	bool IsBenchmarkComplete() const { return m_benchmarkComplete; }
 	VulkanRenderer* GetRenderer() { return m_renderer; }
 	const BenchmarkConfig& GetBenchmarkConfig() const { return m_benchConfig; }
-	void SetScheme(RenderScheme s) { m_benchConfig.scheme = s; }
+	// Hot-switch the render scheme. Logs only on an actual change so the console
+	// isn't spammed when called every frame from the panel/keyboard. Both the
+	// ImGui radios and the NUM1/2/3 shortcuts route through here.
+	void SetScheme(RenderScheme s) {
+		if (m_benchConfig.scheme == s) return;
+		m_benchConfig.scheme = s;
+		std::cout << "[GPUDriven] Render scheme -> " << (int)s << " ("
+		          << (s == RenderScheme::CPU_Instanced    ? "CPU instanced"     :
+		              s == RenderScheme::CPU_CullIndirect  ? "CPU cull+indirect" :
+		                                                     "GPU cull+indirect") << ")\n";
+	}
+	uint32_t GetLastDrawCalls() const { return m_drawCallCount; }
+	void SetBenchmarkEnabled(bool on) { m_benchmarkEnabled = on; }
+	void ResetBenchmarkState(RenderScheme scheme, uint32_t warmup, uint32_t record, const std::string& outputPath) {
+		m_benchConfig.scheme = scheme;
+		m_benchConfig.warmupFrames = warmup;
+		m_benchConfig.recordFrames = record;
+		m_benchConfig.outputPath = outputPath;
+		m_frameStats.clear();
+		m_recordFrameIdx = 0;
+		m_isRecording = false;
+		m_benchmarkComplete = false;
+	}
+	void SetSceneParams(uint32_t gridSize, uint32_t chunkSize, uint32_t seed, uint32_t density) {
+		m_benchConfig.gridSize = gridSize;
+		m_benchConfig.seed = seed;
+		m_benchConfig.density = density;
+		m_benchConfig.chunkSize = chunkSize;
+	}
+
+	const std::vector<FrameStats>& GetFrameStats() const { return m_frameStats; }
+	const std::vector<uint32_t>& GetTileGrid() const { return m_tileGrid; }
+	uint32_t GetGridSize() const { return m_benchConfig.gridSize; }
+	bool IsBenchmarkRecording() const { return m_isRecording; }
+	double GetLastUpdateUs() const { return m_lastUpdateUs; }
+	void RunLocalUpdate(uint32_t count) { RegenerateChunks(count); }
+
 #ifdef USE_IMGUI
 	void SetGui(GuiWrapper* gui) { m_gui = gui; }
+	void SetBenchPanel(BenchmarkPanel* panel) { m_benchPanel = panel; }
 #endif
+
+	void GenerateScene(const std::vector<uint32_t>& tileGrid);
+	void UpdateSceneFromTileGrid(const std::vector<uint32_t>& grid);
+	void SetRenderPartial(bool partial) { m_renderPartial = partial; }
+	void CreateBuffers();
+	void CreateDescriptorSets();
+	void CreateQueryPool();
 
 protected:
 	void Initialise();
@@ -120,11 +181,11 @@ protected:
 	void UploadMeshWait(VulkanMesh& m);
 
 	void GenerateScene();
-	void CreateBuffers();
 	void CreatePipelines();
-	void CreateDescriptorSets();
 	void WriteInstanceData();
 	void ComputeChunkAABBs();
+	void ReadbackGPUVisibility();
+	void RegenerateChunks(uint32_t count);
 
 	void RenderScheme1(float dt);
 	void RenderScheme2(float dt);
@@ -136,6 +197,11 @@ protected:
 	void BeginMeasurement();
 	void EndMeasurement();
 	void WriteCSVSummary();
+
+public:
+	void WriteUpdatePilotCSV(const std::vector<double>& samples, uint32_t updateSize,
+	                         const std::string& path);
+protected:
 
 	VulkanInitialisation m_vkInit;
 	VulkanRenderer*      m_renderer      = nullptr;
@@ -183,17 +249,31 @@ protected:
 	bool m_isRecording;
 	bool m_benchmarkComplete;
 	uint32_t m_currentFrame;
+	uint32_t m_recordFrameIdx = 0;
+	uint32_t m_drawCallCount = 0;
+	VulkanBuffer m_visibilityStaging;
 	LARGE_INTEGER m_qpcFrequency;
-	LARGE_INTEGER m_frameStartQpc;
+	LARGE_INTEGER m_frameStartQpc;   // wall-clock frame start (set in BeginMeasurement)
+	double m_cpuRecordAccumUs = 0;   // accumulated CPU recording time, excludes fence wait
+	LARGE_INTEGER m_segStartQpc;     // current CPU segment start
+	double m_cpuWaitUs = 0;          // fence-wait duration for current frame
+
+	// CPU timing segment helpers (exclude BeginRenderToScreen fence wait)
+	void CpuSegBegin();
+	void CpuSegEnd();
+	void MarkFenceWait(double waitUs);
 
 	class ChunkMonitor* m_monitor = nullptr;
+		uint32_t m_monitorGridChunks = 0;
 	bool m_altWasHeld = false;
+	bool m_pendingReadback = false;
+	bool m_benchmarkEnabled = false;
+	bool m_renderPartial = false;
+	float m_cellSize = 4.0f;
+	double m_lastUpdateUs = 0.0;   // pilot: last RegenerateChunks transfer cost
 #ifdef USE_IMGUI
 	GuiWrapper* m_gui = nullptr;
+	BenchmarkPanel* m_benchPanel = nullptr;
 #endif
 
-	VulkanTexture* m_offscreenColour;
-	VulkanTexture* m_offscreenDepth;
-	void CreateOffscreenResources();
-	void BeginOffscreenRender(vk::CommandBuffer cmd);
 };
